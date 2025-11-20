@@ -1,0 +1,1304 @@
+// @ts-nocheck
+// ================== Boot & safety ==================
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', (e && e.stack) || e));
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', (e && e.stack) || e));
+
+// ================== Setup básico ==================
+require('dotenv').config();
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+// const twilio = require('twilio'); // ⛔️ YA NO USAMOS TWILIO
+const OpenAI = require('openai');
+const IORedis = require('ioredis');
+const nodemailer = require('nodemailer');
+const axios = require('axios');
+const FormData = require('form-data');
+
+const app = express();
+
+// Webhooks (WATI) mandan JSON normalmente:
+app.use(express.json());
+// También dejamos urlencoded por si acaso:
+app.use(express.urlencoded({ extended: false }));
+
+// ================== Config ==================
+const PORT = process.env.PORT || 3008;
+const TIMEZONE = process.env.TIMEZONE || 'America/Bogota';
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '6000', 10);
+const OPENAI_MAX_ATTEMPTS = parseInt(process.env.OPENAI_MAX_ATTEMPTS || '1', 10);
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '1200', 10);
+
+const MAX_USER_CHARS = parseInt(process.env.MAX_USER_CHARS || '2000', 10);
+const HISTORY_MAX_TURNS = parseInt(process.env.HISTORY_MAX_TURNS || '6', 10);
+const UNLIMITED_INPUT = String(process.env.UNLIMITED_INPUT || '1') === '1';
+
+// Estos flags venían de Twilio, pero los dejamos por compatibilidad interna
+const WHATSAPP_ACK = String(process.env.WHATSAPP_ACK || '0') === '1';
+const TWIML_EMAIL_COPY = String(process.env.TWIML_EMAIL_COPY || '0') === '1';
+
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
+const BOT_NAME = process.env.BOT_NAME || 'Juan';
+const SALES_EMAIL = process.env.SALES_EMAIL || process.env.FROM_EMAIL || 'ventas@tolentinosftw.com';
+
+const DEBUG = String(process.env.DEBUG || '1') === '1';
+const EMAIL_ON = String(process.env.DISABLE_EMAIL || '0') !== '1';
+
+// Limpieza agresiva al detectar un nuevo carrito (para no arrastrar datos)
+const CLEAR_ON_NEW_CART = String(process.env.CLEAR_ON_NEW_CART || '1') === '1';
+
+// ================== SDKs ==================
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); // ⛔️ YA NO
+
+// ================== Redis ==================
+const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+const TTL_SECONDS = (parseInt(process.env.MEMORY_TTL_DAYS, 10) || 30) * 24 * 60 * 60;
+
+// Idempotencia y lock
+const IDEMP_TTL = 2 * 24 * 3600; // 48h
+const LOCK_TTL = 3; // 3s lock por mensaje (evita carreras/silencios)
+
+// ================== Mailer ==================
+const mailer = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    auth: process.env.SMTP_USER && process.env.SMTP_PASS ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+});
+
+// ===== Helpers =====
+const emsg = (e) => (e && e.message) ? e.message : String(e);
+const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+
+function withTimeout(promise, ms) {
+    let t;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => { t = setTimeout(() => reject(new Error('TIMEOUT')), ms); }),
+    ]).finally(() => clearTimeout(t));
+}
+
+// — COP: convierte "35.000" o "40,400" a 35000 / 40400
+function parseCOPnum(v) {
+    if (v == null) return null;
+    const digits = String(v).replace(/[^\d]/g, '');
+    const n = Number(digits);
+    return Number.isFinite(n) ? n : null;
+}
+
+function formatCOP(n) {
+    try { return '$' + Number(n).toLocaleString('es-CO'); } catch { return '$' + n; }
+}
+
+// Envío de email (wrapper seguro)
+async function sendEmail({ to, subject, text, html, attachments }) {
+    try {
+        if (!EMAIL_ON) return;
+        if (!to) to = process.env.ADMIN_EMAIL;
+        if (!to) return;
+        const info = await mailer.sendMail({
+            from: process.env.FROM_EMAIL || SALES_EMAIL,
+            to,
+            subject: subject || '(sin asunto)',
+            text: text || undefined,
+            html: html || undefined,
+            attachments: attachments || undefined,
+        });
+        if (DEBUG) console.log('[MAIL] sent:', info.messageId);
+    } catch (e) {
+        console.error('[MAIL] error:', emsg(e));
+    }
+}
+
+// ================== Telegram ==================
+
+// Telegram: enviar fotos con caption
+async function sendTelegramPhotos(paths = [], caption = '') {
+    try {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return false;
+
+        for (let i = 0; i < paths.length; i++) {
+            const fd = new FormData();
+            fd.append('chat_id', chatId);
+
+            if (i === 0 && caption) {
+                fd.append('caption', caption);
+            }
+
+            fd.append('photo', fs.createReadStream(paths[i]));
+
+            await axios.post(
+                'https://api.telegram.org/bot' + token + '/sendPhoto',
+                fd, {
+                    headers: fd.getHeaders(),
+                    timeout: 20000,
+                }
+            );
+        }
+
+        return true;
+    } catch (e) {
+        console.error('[TG] sendPhoto error:', (e && e.message) ? e.message : e);
+        return false;
+    }
+}
+
+// Enviar texto a Telegram (mensaje normal)
+async function sendTelegramTextMessage(text) {
+    try {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) {
+            console.warn('[TG] Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID, no envío nada.');
+            return false;
+        }
+
+        await axios.post(
+            `https://api.telegram.org/bot${token}/sendMessage`, {
+                chat_id: chatId,
+                text,
+                parse_mode: 'Markdown'
+            }, { timeout: 20000 }
+        );
+
+        console.log('[TG] Mensaje de orden enviado a Telegram ✅');
+        return true;
+    } catch (e) {
+        console.error('[TG] error al enviar mensaje a Telegram:', e && e.message ? e.message : e);
+        return false;
+    }
+}
+
+function buildTelegramOrderSummary(waId, lead) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+
+    const lines = [];
+    lines.push(`# Pedido de ${waId} (${ts})`);
+    lines.push('');
+    lines.push('## Datos de envío');
+    lines.push(`- Nombre: ${lead.name || '-'}`);
+    lines.push(`- Celular: ${lead.phone || '-'}`);
+    lines.push(`- Dirección: ${lead.address || '-'}`);
+    lines.push(`- Apto/Casa: ${lead.apto || '-'}`);
+    lines.push(`- Barrio: ${lead.neighborhood || '-'}`);
+    lines.push(`- Ciudad: ${lead.city || '-'}`);
+    lines.push(`- Referencia: ${lead.reference || '-'}`);
+    lines.push(`- Horario preferido: ${lead.schedule || '-'}`);
+    lines.push('');
+    lines.push('## Comprobantes (imágenes enviadas)');
+    if (lead.paymentProofs && lead.paymentProofs.length) {
+        lead.paymentProofs.forEach((p, idx) => {
+            lines.push(`- #${idx + 1}: ${p.url} (${p.contentType || 'image/jpeg'})`);
+        });
+    } else {
+        lines.push('- (sin imágenes registradas)');
+    }
+
+    return lines.join('\n');
+}
+
+// Telegram: enviar solo texto
+async function sendTelegramText(text) {
+    try {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return false;
+
+        await axios.post(
+            'https://api.telegram.org/bot' + token + '/sendMessage', {
+                chat_id: chatId,
+                text: text,
+                parse_mode: 'Markdown',
+            }, {
+                timeout: 20000,
+            }
+        );
+
+        return true;
+    } catch (e) {
+        console.error('[TG] sendText error:', (e && e.message) ? e.message : e);
+        return false;
+    }
+}
+
+// ================== WATI API ==================
+const WATI_API_ENDPOINT = process.env.WATI_API_ENDPOINT || '';
+const WATI_TOKEN = process.env.WATI_TOKEN || '';
+
+async function sendWatiText(waId, body) {
+    try {
+        if (!WATI_API_ENDPOINT || !WATI_TOKEN) {
+            console.error('[WATI][SEND] Falta WATI_API_ENDPOINT o WATI_TOKEN');
+            return;
+        }
+        if (!waId || !body) return;
+
+        const url = `${WATI_API_ENDPOINT}/api/v1/sendSessionMessage/${waId}`;
+
+        const payload = {
+            messageText: body,
+        };
+
+        const resp = await axios.post(url, payload, {
+            headers: {
+                // El token YA incluye "Bearer ..."
+                Authorization: WATI_TOKEN,
+                'Content-Type': 'application/json',
+            },
+            timeout: 20000,
+        });
+
+        if (DEBUG) console.log('[WATI][SEND] OK', JSON.stringify(resp.data));
+    } catch (e) {
+        console.error('[WATI][SEND] error:', emsg(e));
+    }
+}
+
+
+
+// ================== UltraMsg API ==================
+const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID || '';
+const ULTRA_TOKEN = process.env.ULTRA_TOKEN || '';
+const ULTRA_BASE_URL =
+    process.env.ULTRA_BASE_URL ||
+    (ULTRA_INSTANCE_ID ? `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}` : '');
+
+async function sendUltraText(waId, body) {
+    try {
+        if (!ULTRA_BASE_URL || !ULTRA_TOKEN) {
+            console.error('[ULTRA][SEND] Falta ULTRA_BASE_URL o ULTRA_TOKEN');
+            return;
+        }
+        if (!waId || !body) return;
+
+        // UltraMsg usa solo dígitos (sin @c.us)
+        const to = String(waId).replace(/[^\d]/g, '');
+
+        const params = new URLSearchParams();
+        params.append('token', ULTRA_TOKEN);
+        params.append('to', to);
+        params.append('body', body);
+        params.append('priority', '10');
+
+        const resp = await axios.post(
+            `${ULTRA_BASE_URL}/messages/chat`,
+            params.toString(), {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                timeout: 20000,
+            }
+        );
+
+        if (DEBUG) console.log('[ULTRA][SEND] OK', resp.data);
+    } catch (e) {
+        console.error('[ULTRA][SEND] error:', emsg(e));
+    }
+}
+
+
+
+
+// ================== Catálogo (JSON local) ==================
+const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
+let CATALOG = [];
+
+function loadCatalog() {
+    try {
+        CATALOG = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
+        if (DEBUG) console.log('[CATALOG] items:', CATALOG.length);
+    } catch (e) {
+        console.error('[CATALOG] error:', e.message);
+        CATALOG = [];
+    }
+}
+loadCatalog();
+
+function coalesce() {
+    for (let i = 0; i < arguments.length; i++) {
+        const v = arguments[i];
+        if (v !== undefined && v !== null && v !== '') return v;
+    }
+    return null;
+}
+
+function getName(p) { return coalesce(p.name, p.Nombre, p.title, p.productName, p.nombre, p.titulo) || ''; }
+
+function getId(p) { return coalesce(p.id, p._id, p.sku, p.code, p.codigo, p.slug) || ''; }
+
+function getPriceRaw(p) { return coalesce(p.price, p.precio, p.unit_price, p.unitPrice, p.valor, p.cost, p.costo); }
+
+function searchCatalog(q) {
+    q = (q || '').toLowerCase();
+    return CATALOG.filter(p => {
+        const txt = [getName(p), p.brand || p.marca || '', p.category || p.categoria || '', (p.tags || []).join(' ')].join(' ').toLowerCase();
+        return txt.includes(q);
+    }).slice(0, 10);
+}
+
+// ================== Parseo de carrito web ==================
+function parseWebCart(text) {
+    const out = { items: [], totalFromText: null };
+    if (!text) return out;
+    const blockRe = /\*([^*]+)\*\s*Cantidad:\s*(\d+)\s*Precio\s*unitario\s*:\s*([\$\d\.\,]+)\s*Subtotal\s*:\s*([\$\d\.\,]+)/gim;
+    let m;
+    while ((m = blockRe.exec(text)) !== null) {
+        const name = m[1].trim();
+        const qty = parseInt(m[2], 10);
+        const unit = parseCOPnum(m[3]);
+        const subtotal = parseCOPnum(m[4]);
+        if (!name || !Number.isFinite(qty) || !Number.isFinite(unit)) continue;
+        out.items.push({ name, qty, unit, subtotal: Number.isFinite(subtotal) ? subtotal : qty * unit });
+    }
+    const totalMatch = text.match(/Total\s*a\s*pagar\s*:\s*([\$\d\.\,]+)/i);
+    if (totalMatch) out.totalFromText = parseCOPnum(totalMatch[1]);
+    return out;
+}
+
+function looksLikeWebCart(text) {
+    if (!text) return false;
+    const a = /\*\s*[^*]+\s*\*\s*Cantidad:\s*\d+/i.test(text);
+    const b = /Precio\s*unitario\s*:\s*[\$\d\.\,]+/i.test(text);
+    const c = /Subtotal\s*:\s*[\$\d\.\,]+/i.test(text);
+    const d = /Total\s*a\s*pagar\s*:\s*[\$\d\.\,]+/i.test(text);
+    return (a && b && c) || d;
+}
+
+// ================== Envíos (reglas locales) ==================
+function normalize(t) { return (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+
+function inferCity(linesJoined) {
+    const t = normalize(linesJoined);
+    if (/\brionegro\b/.test(t)) return 'rionegro';
+    if (/\b(llano\s*grande|llanogrande)\b/.test(t)) return 'llanogrande';
+    if (/\bmarinilla\b/.test(t)) return 'marinilla';
+    if (/\b(la\s*ceja|ceja)\b/.test(t)) return 'laceja';
+    if (/\bcarmen\b/.test(t) && /\bviboral\b/.test(t)) return 'carmenviboral';
+    if (/\bmedellin\b/.test(t)) return 'medellin';
+    if (/\benvigado\b/.test(t)) return 'envigado';
+    if (/\bsabaneta\b/.test(t)) return 'sabaneta';
+    if (/\bbello\b/.test(t)) return 'bello';
+    if (/\bitag[uü]i\b/.test(t)) return 'itagui';
+    return null;
+}
+
+function shippingForCity(cityKey) {
+    if (!cityKey) return { allowed: null, price: null, note: 'Confírmame ciudad para calcular envío. Por ahora solo Antioquia.' };
+    if (['rionegro', 'llanogrande', 'marinilla', 'laceja', 'carmenviboral'].includes(cityKey))
+        return { allowed: true, price: 12500, note: 'Envío local 12.500.' };
+    if (['medellin', 'envigado', 'sabaneta', 'bello', 'itagui'].includes(cityKey))
+        return { allowed: true, price: 15000, note: 'Envío Área MDE 15.000.' };
+    return { allowed: false, price: null, note: 'Por ahora solo despachamos en Antioquia.' };
+}
+
+// ====== Helpers de envío (completitud y faltantes) ======
+const REQUIRED_SHIPPING_FIELDS = ['name', 'phone', 'address', 'city'];
+
+function isShippingComplete(lead) {
+    if (!lead) return false;
+    return REQUIRED_SHIPPING_FIELDS.every(k => {
+        const v = lead[k];
+        return v !== undefined && v !== null && String(v).trim() !== '';
+    });
+}
+
+function missingShippingFields(lead) {
+    const L = lead || {};
+    const map = {
+        name: 'Nombre completo',
+        phone: 'Celular',
+        address: 'Dirección + Apto/Casa',
+        city: 'Ciudad',
+    };
+    return REQUIRED_SHIPPING_FIELDS
+        .filter(k => !L[k] || String(L[k]).trim() === '')
+        .map(k => map[k]);
+}
+
+// ====== Pago reciente (evita arrastre de pruebas antiguas) ======
+function isPaidRecent(lead, hours = 6) {
+    if (!lead) return false;
+    const proofs = Array.isArray(lead.paymentProofs) ? lead.paymentProofs : [];
+    if (!proofs.length) return false;
+    const ts = Number(lead.paymentReceivedAt || 0);
+    if (!ts) return false;
+    return (Date.now() - ts) < hours * 3600 * 1000;
+}
+
+// ================== Prompt del bot ==================
+const systemPrompt = `
+Eres ${BOT_NAME}, asesor de ventas de "${COMPANY_NAME}". Siempre en español, cálido y concreto.
+
+Objetivo: cerrar la compra sin fricción.
+
+Reglas:
+- Si el usuario envía un carrito (lista con "Cantidad / Precio unitario / Subtotal"), responde con:
+  1) Resumen de ítems y total,
+  2) Métodos de pago (Nequi / Davivienda / BRE-B),
+  3) Solicita datos de envío (Nombre, Celular, Dirección + Apto/Casa, Barrio, Ciudad, Referencia opcional, Horario 8–15).
+- Si ya tengo datos de envío suficientes, NO pidas otra vez dirección/productos: SOLO solicita foto del comprobante.
+- Si llega la foto del comprobante, confirma pago y hora de entrega:
+   • Si el cliente dio hora: "Haremos lo posible por las HH:00; los envíos salen entre 8–15."
+   • Si no dio hora: "Lo despachamos hoy en la ventana 8–15."
+- Ciudades: Rionegro/La Ceja/Carmen/Llanogrande/Marinilla $12.500; Medellín/Envigado/Sabaneta/Bello/Itagüí $15.000; otros: por ahora solo Antioquia.
+- No pidas cédula/NIT.
+- Mantén 4–8 líneas máx. y evita tono robótico.
+`.trim();
+
+// ================== Parseo y contexto ==================
+const CITIES = [
+    'rionegro', 'la ceja', 'carmen de viboral', 'carmen del viboral',
+    'llanogrande', 'marinilla', 'medellin', 'envigado', 'sabaneta', 'bello', 'itagüí', 'itagui'
+];
+
+function norm(s) { return (s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+
+function onlyDigits(s) { return (s || '').replace(/[^\d]/g, ''); }
+
+function capWords(s) { return (s || '').split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '); }
+
+// ===== DIRECCIONES — heurística reforzada =====
+function isLikelyName(s) {
+    const t = (s || '').trim();
+    if (!t) return false;
+    if (/\d|#/.test(t)) return false;
+    const words = t.split(/\s+/);
+    if (words.length < 2) return false;
+    if (words.some(w => w.length < 2)) return false;
+    return true;
+}
+
+// Palabras/abreviaciones comunes de vía
+const STREET_TOKENS = '(?:carrera|cra|kr|kra|k|cr|calle|cll|cl|avenida|av|ak|autopista|tv|transv|transversal|dg|diagonal|mz|manzana|km|vereda|via)';
+
+// Patrones numéricos tipo “123 # 45-67”, “No 23-10”, “N° 12-34”
+const HOUSE_NUM_PAT =
+    '(?:n(?:o|ro|°)\\.?\\s*\\d+(?:\\s*-\\s*\\d+)?)' +
+    '|(?:\\d{1,3}[a-z]?\\s*(?:#|-)\\s*\\d{1,3}(?:\\s*-\\s*\\d{1,3})?)';
+
+function isLikelyAddress(s) {
+    const t = norm(s);
+    if (!t) return false;
+    if (/^\d{6,}/.test(t)) return false;
+
+    const hasStreetToken = new RegExp('\\b' + STREET_TOKENS + '\\b').test(t);
+    const hasHouseNum = new RegExp('\\b(?:' + HOUSE_NUM_PAT + ')\\b').test(t);
+    const hasHash = t.includes('#');
+
+    if (hasStreetToken && (hasHouseNum || hasHash)) return true;
+    if (hasHouseNum) return true;
+    if (/\d/.test(t) && /[#-]/.test(t) && hasStreetToken) return true;
+
+    return false;
+}
+
+function isLikelyNeighborhood(s) {
+    const t = (s || '').trim();
+    if (!t) return false;
+    if (/\#|\d{2,}/.test(t)) return false;
+    if (t.length < 3 || t.length > 60) return false;
+    return true;
+}
+
+function findCityFreeform(lines) {
+    const joined = ' ' + lines.join(' ') + ' ';
+    const t = norm(joined);
+    const inf = inferCity(joined);
+    if (inf) {
+        const map = {
+            rionegro: 'Rionegro',
+            laceja: 'La Ceja',
+            carmenviboral: 'Carmen de Viboral',
+            llanogrande: 'Llanogrande',
+            marinilla: 'Marinilla',
+            medellin: 'Medellín',
+            envigado: 'Envigado',
+            sabaneta: 'Sabaneta',
+            bello: 'Bello',
+            itagui: 'Itagüí'
+        };
+        return map[inf];
+    }
+    for (const c of CITIES) {
+        if (t.includes(' ' + norm(c) + ' ')) return capWords(c);
+    }
+    return undefined;
+}
+
+function parseHourFreeform(text) {
+    const m1 = text.match(/\b(\d{1,2})\s*[:\.]\s*(\d{2})\b/i);
+    if (m1) { let h = parseInt(m1[1], 10); if (h >= 0 && h <= 23) return h; }
+    const m2 = text.match(/\b(\d{1,2})\s*(am|pm)\b/i);
+    if (m2) { let h = parseInt(m2[1], 10); const suf = m2[2].toLowerCase(); if (suf === 'pm' && h < 12) h += 12; if (h >= 0 && h <= 23) return h; }
+    return undefined;
+}
+
+function extractAddressFromLine(ln) {
+    const t = (ln || '').trim();
+    if (!t) return '';
+
+    const addrRe = new RegExp(
+        '(' +
+        '\\b' + STREET_TOKENS + '\\b\\.?\\s*[^,;\\n]{0,80}' +
+        '|' +
+        '\\b(?:' + HOUSE_NUM_PAT + ')\\b[^,;\\n]{0,40}' +
+        ')',
+        'i'
+    );
+
+    const m = t.match(addrRe);
+    if (!m) {
+        return isLikelyAddress(t) ? t : '';
+    }
+
+    let out = m[0].trim();
+
+    if (/^\d{6,}/.test(out)) return '';
+
+    out = out.replace(/\b\d{1,2}\s*(am|pm)\b/ig, '').trim();
+    out = out.replace(/(?:\+57\s*)?3[\s-]?\d(?:[\s-]?\d){8}\b/g, '').trim();
+    out = out.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig, '').trim();
+
+    out = out.replace(/\s*#\s*/g, ' # ').replace(/\s*-\s*/g, '-').replace(/\s{2,}/g, ' ').trim();
+
+    return out;
+}
+
+// Parser principal (no sobreescribe con basura)
+function parseContactAndShipping(text, prevLead = {}) {
+    const out = {};
+    if (!text) return out;
+
+    const rawLines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    const phoneMatch = text.match(/(?:\+57\s*)?(3[\s-]?\d(?:[\s-]?\d){8})\b/);
+    if (phoneMatch) {
+        const digits = onlyDigits(phoneMatch[0]);
+        out.phone = digits.length === 12 && digits.startsWith('57') ? digits.slice(2) : digits;
+    }
+
+    const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    if (emailMatch) out.email = emailMatch[0];
+
+    const nameDecl = text.match(/\b(me llamo|mi nombre es)\s+([a-záéíóúñ ]{2,60})/i);
+    if (nameDecl) out.name = capWords(nameDecl[2].trim());
+
+    const city = findCityFreeform(rawLines);
+    if (city) out.city = city;
+
+    const h = parseHourFreeform(text);
+    if (typeof h === 'number') out.preferredHour = h;
+
+    let addressIdx = -1;
+    for (let i = 0; i < rawLines.length; i++) {
+        const ln = rawLines[i];
+
+        const mDir = ln.match(/\b(direcci[oó]n|dir)\s*[:\-]?\s*(.+)$/i);
+        if (mDir) {
+            const cand = extractAddressFromLine(mDir[2]);
+            if (cand) {
+                out.address = cand;
+                addressIdx = i;
+                break;
+            }
+        }
+
+        if (isLikelyAddress(ln)) {
+            const cand = extractAddressFromLine(ln);
+            if (cand) {
+                out.address = cand;
+                addressIdx = i;
+                break;
+            }
+        }
+    }
+
+    for (let i = 0; i < rawLines.length; i++) {
+        const ln = rawLines[i];
+        const mBar = ln.match(/\b(barrio)\s*[:\-]?\s*(.+)$/i);
+        if (mBar) {
+            const cand = mBar[2].trim();
+            if (isLikelyNeighborhood(cand)) { out.neighborhood = capWords(cand); break; }
+        }
+    }
+    if (!out.neighborhood && addressIdx !== -1) {
+        const candidates = [];
+        if (rawLines[addressIdx - 1]) candidates.push(rawLines[addressIdx - 1]);
+        if (rawLines[addressIdx + 1]) candidates.push(rawLines[addressIdx + 1]);
+        for (const c0 of candidates) {
+            const cand = (c0 || '').trim();
+            if (!cand) continue;
+            if (isLikelyNeighborhood(cand)) {
+                const candNorm = norm(cand);
+                const nameNorm = norm(out.name || prevLead.name || '');
+                const cityNorm = norm(out.city || prevLead.city || '');
+                if (candNorm && candNorm !== nameNorm && candNorm !== cityNorm) {
+                    out.neighborhood = capWords(cand);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!out.name) {
+        for (const ln of rawLines) {
+            const lnNorm = norm(ln);
+            if (/\d/.test(ln)) continue;
+            if (ln.length > 60) continue;
+            if (isLikelyName(ln)) {
+                const clashCity = norm(out.city || '') === lnNorm;
+                const looksAddr = isLikelyAddress(ln);
+                if (!clashCity && !looksAddr) {
+                    if (out.neighborhood && norm(out.neighborhood) === lnNorm) continue;
+                    out.name = capWords(ln);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (out.neighborhood && out.name && norm(out.neighborhood) === norm(out.name)) {
+        delete out.neighborhood;
+    }
+
+    return out;
+}
+
+function clampInput(text) {
+    if (!text) return { text: '', notice: '' };
+    if (UNLIMITED_INPUT) return { text, notice: '' };
+    if (text.length <= MAX_USER_CHARS) return { text, notice: '' };
+    const lines = text.split(/\r?\n/);
+    const kept = [];
+    for (let i = 0; i < lines.length; i++) {
+        const ln = String(lines[i]);
+        if (/^\s*(-|\d+[\).\s])/.test(ln)) kept.push(ln.trim());
+        if (kept.join('\n').length > MAX_USER_CHARS) break;
+    }
+    let final = kept.join('\n');
+    if (!final) final = text.slice(0, MAX_USER_CHARS);
+    const notice = '✂️ Tu mensaje era muy largo; lo resumí para responder ágilmente.\n\n';
+    return { text: final, notice };
+}
+
+function pickRecentHistory(hist) {
+    if (!Array.isArray(hist)) return [];
+    const trimmed = hist.slice(-HISTORY_MAX_TURNS * 2);
+    let out = [],
+        total = 0,
+        BUDGET = 8000;
+    for (let i = trimmed.length - 1; i >= 0; i--) {
+        const m = trimmed[i];
+        const len = m && m.content ? m.content.length : 0;
+        if (total + len > BUDGET) break;
+        out.unshift(m);
+        total += len;
+    }
+    return out;
+}
+
+// ====== FALLBACK contextual (cuando falle OpenAI)
+function buildFallbackReply(lead) {
+    const paid = isPaidRecent(lead);
+    const miss = missingShippingFields(lead);
+
+    if (!paid && isShippingComplete(lead)) {
+        const resumen =
+            (lead.name ? `• Nombre: ${lead.name}\n` : '') +
+            (lead.phone ? `• Celular: ${lead.phone}\n` : '') +
+            (lead.address ? `• Dirección: ${lead.address}\n` : '') +
+            (lead.apartment ? `• Apto/Casa: ${lead.apartment}\n` : '') +
+            (lead.neighborhood ? `• Barrio: ${lead.neighborhood}\n` : '') +
+            (lead.city ? `• Ciudad: ${lead.city}\n` : '') +
+            (lead.reference ? `• Referencia: ${lead.reference}\n` : '') +
+            (lead.preferredHour != null ? `• Horario preferido: ${String(lead.preferredHour).padStart(2, '0')}:00\n` : '');
+
+        return (
+            resumen ?
+            `¡Perfecto! Tomé estos *datos de envío*:\n${resumen}\n` :
+            '' +
+            `Para programar el despacho, por favor envíame la *foto del comprobante de pago*.\n\n` +
+            `Métodos de pago:\n` +
+            `- *Nequi:* 0090610545\n` +
+            `- *BRE-B:* \`@DAVIPERROTGATOTE\``
+        );
+    }
+
+    if (!isShippingComplete(lead)) {
+        const faltan = miss.map(f => `• *${f}*`).join('\n');
+        return `¡Gracias! Para despachar, confírmame por favor:\n${faltan}\n` +
+            `\n(Puedes enviarlos en varios mensajes, voy registrando todo).`;
+    }
+
+    return 'Listo. ¿Deseas que lo despachemos hoy? Si es así, puedo recibir el comprobante de pago cuando lo tengas.';
+}
+
+// ================== OpenAI (timeout + reintentos) ==================
+async function askOpenAI(messages, opts) {
+    opts = opts || {};
+    const model = opts.model || OPENAI_MODEL;
+    const maxTokens = opts.maxTokens || OPENAI_MAX_TOKENS;
+    const temperature = typeof opts.temperature === 'number' ? opts.temperature : 0.4;
+
+    for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+        try {
+            if (DEBUG) console.log('[AI] intento', attempt, '| msgs=', messages.length);
+            const resp = await withTimeout(
+                openai.chat.completions.create({ model, messages, temperature, max_tokens: maxTokens }),
+                OPENAI_TIMEOUT_MS
+            );
+            const ok = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+            if (ok) {
+                const text = String(resp.choices[0].message.content).trim();
+                if (DEBUG) console.log('[AI] OK len=', text.length);
+                return text;
+            }
+            throw new Error('Respuesta vacía de OpenAI');
+        } catch (e) {
+            console.error('[AI] error intento', attempt, ':', emsg(e));
+            if (attempt === OPENAI_MAX_ATTEMPTS) throw e;
+            await new Promise(r => setTimeout(r, 400 * attempt));
+        }
+    }
+}
+
+// ===== Twilio media from request (ya casi no se usa, pero lo dejamos por compatibilidad) =====
+function getMediaUrlsFromRequest(req) {
+    const out = [];
+    const num = Number((req && req.body && req.body.NumMedia) ? req.body.NumMedia : 0);
+    for (let i = 0; i < num; i++) {
+        const url = (req && req.body) ? req.body['MediaUrl' + i] : null;
+        const ctype = (req && req.body) ? req.body['MediaContentType' + i] : null;
+        if (url) out.push({ url: String(url), contentType: String(ctype || '') });
+    }
+    return out;
+}
+
+// ===== Archivo resumen pedido =====
+function writeOrderFile({ wa, finalReply, body, lead, media }) {
+    try {
+        const dir = path.join(__dirname, 'orders');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const file = path.join(dir, `${ts}__${(wa || '').replace(/[^+\d]/g, '')}.md`);
+        const lines = [];
+        lines.push(
+            `# Pedido de ${wa || '-'} (${ts})`,
+            ``,
+            `## Resumen generado para el cliente`,
+            finalReply || '(vacío)',
+            ``,
+            '## Mensaje original del cliente',
+            body || '(vacío)',
+            ``,
+            '## Datos de envío (si disponibles)',
+            '- Nombre: ' + ((lead && lead.name) || '-'),
+            '- Celular: ' + ((lead && lead.phone) || '-'),
+            '- Dirección: ' + ((lead && lead.address) || '-'),
+            '- Apto/Casa: ' + ((lead && lead.apartment) || '-'),
+            '- Barrio: ' + ((lead && lead.neighborhood) || '-'),
+            '- Ciudad: ' + ((lead && lead.city) || '-'),
+            '- Referencia (opcional): ' + ((lead && lead.reference) || '-'),
+            '- Horario preferido: ' + ((lead && lead.preferredHour != null) ? (String(lead.preferredHour).padStart(2, '0') + ':00') : '-'),
+            ``,
+            '## Comprobantes (imágenes enviadas)'
+        );
+        if (media && media.length) media.forEach((m, i) => lines.push(`- #${i + 1}: ${m.url} (${m.contentType || 'image'})`));
+        else lines.push('(sin adjuntos)');
+        fs.writeFileSync(file, lines.join('\n'), 'utf8');
+        return file;
+    } catch (e) { console.error('[FILE] writeOrderFile:', emsg(e)); return null; }
+}
+
+// === Enviar WhatsApp con media — ANTES era Twilio; ahora no lo usamos ===
+// const DEDUP_TTL_SECONDS = 120;
+// async function sendWhatsAppOnce(...) { ... }  // ⛔️ ELIMINADO
+
+// ================== WATI Webhook ==================
+// Esta es la URL que debes poner en WATI:  https://TU-NGROK.ngrok-free.app/wati-webhook
+app.post('/wati-webhook', async(req, res) => {
+    try {
+        if (DEBUG) {
+            console.log('[WATI][POST] body =', JSON.stringify(req.body, null, 2));
+        }
+
+        const eventType = req.body.eventType;
+        if (eventType !== 'message') {
+            // otros eventos (status, etc.) se ignoran
+            return res.status(200).json({ ok: true, ignored: true });
+        }
+
+        const waId = String(req.body.waId || '').trim(); // ej: "57310XXXXXXX"
+        const type = req.body.type || 'text';
+        let bodyText = req.body.text || '';
+        const media = [];
+
+        if (type !== 'text') {
+            media.push({
+                url: req.body.data || '',
+                contentType: type,
+            });
+            if (!bodyText) bodyText = `[${type} recibida]`;
+        }
+
+        if (!waId) {
+            console.error('[WATI][POST] waId vacío');
+            return res.status(200).json({ ok: false, reason: 'no_waid' });
+        }
+
+        const userId = 'wati:' + waId;
+
+        if (DEBUG) {
+            console.log('IN WATI >>', userId, '|', (bodyText || '').slice(0, 140), '... | media:', media.length);
+        }
+
+        const result = await processConversation(userId, bodyText, media);
+        const finalReply =
+            (result && result.finalReply) ?
+            result.finalReply :
+            '¡Gracias! Ya mismo te respondo por aquí.';
+
+        await sendWatiText(waId, finalReply);
+
+        if (DEBUG) {
+            console.log('OUT WATI << len =', finalReply.length);
+        }
+
+        return res.status(200).json({ ok: true });
+    } catch (e) {
+        console.error('[WATI] error en /wati-webhook:', emsg(e));
+        return res.status(200).json({ ok: false });
+    }
+});
+
+
+// ================== UltraMsg Webhook ==================
+// URL para UltraMsg: https://TU-NGROK.ngrok-free.app/ultra-webhook  (o / si ya lo pusiste así)
+
+// ================== UltraMsg Webhook ==================
+// URL para UltraMsg: https://TU-NGROK.ngrok-free.app/ultra-webhook  (o / si ya lo pusiste así)
+
+// ================== UltraMsg Webhook ==================
+// ================== UltraMsg Webhook ==================
+
+// ================== UltraMsg Webhook ==================
+
+async function handleUltraWebhook(req, res) {
+    try {
+        if (DEBUG) {
+            console.log('[ULTRA][WEBHOOK] body =', JSON.stringify(req.body, null, 2));
+        }
+
+        const eventType = req.body.event_type || req.body.eventType;
+        if (eventType !== 'message_received') {
+            return res.status(200).json({ ok: true, ignored: true });
+        }
+
+        const data = req.body.data || {};
+        const fromRaw = data.from || '';
+        const waNumber = String(fromRaw).split('@')[0];
+
+        const type = data.type || 'chat';
+        let bodyText = data.body || '';
+        const media = [];
+
+        if (type !== 'chat') {
+            const mediaUrl = data.media || data.body || '';
+            if (mediaUrl) {
+                media.push({
+                    url: mediaUrl,
+                    contentType: type,
+                });
+            }
+            if (!bodyText) bodyText = `[${type} recibida]`;
+        }
+
+        if (!waNumber) {
+            console.error('[ULTRA][WEBHOOK] from vacío');
+            return res.status(200).json({ ok: false, reason: 'no_from' });
+        }
+
+        const userId = 'ultra:' + waNumber;
+
+        if (DEBUG) {
+            console.log('IN ULTRA >>', userId, '|', (bodyText || '').slice(0, 140), '... | media:', media.length);
+        }
+
+        const result = await processConversation(userId, bodyText, media);
+
+        const finalReply =
+            (result && result.finalReply) ?
+            result.finalReply :
+            '¡Gracias! Ya mismo te respondo por aquí.';
+
+        await sendUltraText(waNumber, finalReply);
+
+        if (DEBUG) {
+            console.log('OUT ULTRA << len =', finalReply.length);
+        }
+
+        return res.status(200).json({ ok: true });
+
+    } catch (e) {
+        console.error('[ULTRA] error en webhook:', emsg(e));
+        return res.status(200).json({ ok: false });
+    }
+}
+
+// Ruta principal de UltraMsg
+app.post('/ultra-webhook', handleUltraWebhook);
+
+// Alias opcional SI ya pusiste la URL del webhook sin ruta
+app.post('/', handleUltraWebhook);
+
+
+// Alias opcional SI ya pusiste la URL del webhook sin ruta (solo dominio de ngrok)
+app.post('/', handleUltraWebhook);
+
+// ================== Core de conversación ==================
+async function processConversation(userWa, rawBody, media = []) {
+    const hist = await getHistory(userWa);
+    let lead = await getLead(userWa);
+    const trimmed = (rawBody || '').trim();
+
+    if (/^\s*(reset|reiniciar|nuevo pedido)\s*$/i.test(trimmed)) {
+        await saveLead(userWa, {});
+        await setHistory(userWa, []);
+        return { finalReply: '¡Listo! Empecemos de cero. Envíame tu carrito o los productos, y luego los datos de envío.' };
+    }
+    const parsed = parseContactAndShipping(rawBody, lead || {});
+    const hasMedia = media && media.length > 0;
+    const gotAny = Object.keys(parsed).length > 0 || hasMedia;
+
+    if (gotAny) {
+        const prevProofs = (lead && Array.isArray(lead.paymentProofs)) ? lead.paymentProofs : [];
+
+        const patch = {
+            ...(lead || {}),
+            ...parsed,
+            paymentProofs: prevProofs.concat(media || [])
+        };
+
+        // ⚠️ si llegaron nuevas imágenes, marcamos como pago reciente
+        if (hasMedia) {
+            patch.paymentReceivedAt = Date.now();
+        }
+
+        lead = await saveLead(userWa, patch);
+
+        // pequeña limpieza: si por error barrio == nombre, lo quitamos
+        if (lead && lead.neighborhood && lead.name && norm(lead.neighborhood) === norm(lead.name)) {
+            lead = await saveLead(userWa, {...lead, neighborhood: undefined });
+        }
+
+        if (DEBUG) console.log('[LEAD] actualizado:', lead);
+    }
+
+
+    // Si llegan comprobantes (media) → avisamos por Telegram con un resumen
+    if (media && media.length) {
+        try {
+            const lineas = [];
+
+            let horarioTexto = '-';
+            if (lead && typeof lead.preferredHour === 'number') {
+                horarioTexto = String(lead.preferredHour).padStart(2, '0') + ':00';
+            }
+
+            lineas.push('🧾 *Nuevo Comprobante de Pago*');
+            lineas.push('De: ' + userWa);
+            lineas.push('');
+            lineas.push('*Nombre:* ' + (lead && lead.name ? lead.name : '-'));
+            lineas.push('*Celular:* ' + (lead && lead.phone ? lead.phone : '-'));
+            lineas.push('*Dirección:* ' + (lead && lead.address ? lead.address : '-'));
+            lineas.push('*Ciudad:* ' + (lead && lead.city ? lead.city : '-'));
+            lineas.push('*Horario:* ' + horarioTexto);
+            lineas.push('');
+            lineas.push('----------------------------');
+            lineas.push('*Mensaje original:*');
+            lineas.push(rawBody || '[imagen recibida]');
+            lineas.push('----------------------------');
+
+            const textResumen = lineas.join('\n');
+
+            // Por ahora enviamos solo TEXTO a Telegram
+            await sendTelegramText(textResumen);
+        } catch (e) {
+            console.error('[TG] error al enviar comprobante a Telegram:', emsg(e));
+        }
+    }
+
+    const paid = isPaidRecent(lead);
+    let envioCompleto = isShippingComplete(lead);
+
+    const isCart = looksLikeWebCart(trimmed);
+    if (isCart) {
+        if (CLEAR_ON_NEW_CART) {
+            await saveLead(userWa, {});
+            lead = {};
+            envioCompleto = false;
+        }
+
+        const parsedCart = parseWebCart(trimmed);
+        let total = 0;
+        const lines = [];
+        parsedCart.items.forEach((it, idx) => {
+            const line = `${idx + 1}. *${it.name}* · Cantidad: ${it.qty} · ${formatCOP(it.unit)} = ${formatCOP(it.subtotal)}`;
+            lines.push(line);
+            total += (it.subtotal || (it.qty * it.unit));
+        });
+        if (parsedCart.totalFromText != null && Math.abs(parsedCart.totalFromText - total) < 2000) {
+            total = parsedCart.totalFromText;
+        }
+
+        const cityKey = inferCity([trimmed, (lead && lead.city) || ''].join(' '));
+        const shipInfo = shippingForCity(cityKey);
+        let envioLinea = '';
+        if (shipInfo.allowed === true && shipInfo.price != null) {
+            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
+        } else if (shipInfo.allowed === false) {
+            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${shipInfo.note}`;
+        }
+
+        let totalFinal = total;
+        let lineaEnvio = "";
+
+        // Si hay envío permitido y con precio → súmalo
+        if (shipInfo.allowed === true && shipInfo.price != null) {
+            totalFinal += shipInfo.price;
+            lineaEnvio = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
+        } else if (shipInfo.allowed === false) {
+            lineaEnvio = `\n${(lines.length + 1)}. *Envío*: ${shipInfo.note}`;
+        }
+
+        const header =
+            `Gracias por tu pedido, aquí tienes el resumen:\n\n${lines.join('\n')}` +
+            `${lineaEnvio}\n\n*Total a pagar:* ${formatCOP(totalFinal)}`;
+
+
+        const pagos =
+            `\nPuedes pagar por... envíame el comprobante (foto):\n` +
+            `- *Nequi:* 0090610545\n` +
+            `- *BRE-B:* @DAVIPERROTGATOTE`;
+
+
+        let finalReply = header + '\n' + pagos + '\n';
+
+        if (!envioCompleto) {
+            const faltan = missingShippingFields(lead).map(f => `• *${f}*`).join('\n');
+            finalReply += `\nPara el despacho, confírmame por favor:\n${faltan}\n\n*Por favor responde todo en un solo mensaje.*\n`;
+        } else {
+            finalReply +=
+                `\n¡Perfecto! Ya tengo tus *datos de envío*.\n` +
+                `Para programar el despacho, por favor envíame la *foto del comprobante de pago*.\n`;
+        }
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+
+        try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
+
+        try {
+            // Antes se notificaba por WhatsApp (Twilio), ahora lo mandamos a Telegram
+            await sendTelegramText(`🧾 *Nuevo pedido (carrito)*\nDe: ${userWa}\n\n${finalReply}`);
+        } catch (e) {
+            console.error('[ADMIN] notify (cart):', emsg(e));
+        }
+
+        return { finalReply };
+    }
+
+    // 5) Sin carrito: lógica determinista ANTES de IA
+    // 5) Sin carrito: lógica determinista ANTES de IA
+    if (!paid && envioCompleto) {
+        const resumen =
+            (lead.name ? `• Nombre: ${lead.name}\n` : '') +
+            (lead.phone ? `• Celular: ${lead.phone}\n` : '') +
+            (lead.address ? `• Dirección: ${lead.address}\n` : '') +
+            (lead.apartment ? `• Apto/Casa: ${lead.apartment}\n` : '') +
+            (lead.neighborhood ? `• Barrio: ${lead.neighborhood}\n` : '') +
+            (lead.city ? `• Ciudad: ${lead.city}\n` : '') +
+            (lead.reference ? `• Referencia: ${lead.reference}\n` : '') +
+            (lead.preferredHour != null ? `• Horario preferido: ${String(lead.preferredHour).padStart(2, '0')}:00\n` : '');
+
+        const finalReply =
+            `¡Perfecto! Tomé estos *datos de envío*:\n${resumen}\n` +
+            `Para programar el despacho, por favor envíame la *foto del comprobante de pago*.\n\n` +
+            `Métodos de pago:\n` +
+            `- *Nequi:* 0090610545\n` +
+            `- *BRE-B:* @DAVIPERROTGATOTE`;
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+        try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
+        return { finalReply };
+    }
+
+
+    if (!envioCompleto) {
+        const faltan = missingShippingFields(lead).map(f => `• *${f}*`).join('\n');
+        const finalReply =
+            `¡Gracias! Para despachar, confírmame por favor:\n${faltan}\n\n` +
+            `*Responde todo en un solo mensaje, por favor.*`;
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+        try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
+        return { finalReply };
+    }
+
+    // 6) IA (casos libres). Si falla, fallback contextual.
+    const clamp = clampInput(rawBody);
+    const recentHist = pickRecentHistory(hist);
+    const messages = [{
+            role: 'system',
+            content: `Si el usuario describe necesidad pero no manda carrito: ` +
+                `haz 1–2 preguntas cortas y sugiere 1–3 productos del catálogo si aplica. ` +
+                `Mantén foco en cerrar: si faltan *datos de envío*, pídelos; ` +
+                `si ya hay datos, pide *solo comprobante*.`
+        },
+        { role: 'system', content: systemPrompt },
+        ...recentHist,
+        { role: 'user', content: clamp.text }
+    ];
+
+    let reply;
+    try {
+        reply = await askOpenAI(messages, {
+            model: OPENAI_MODEL,
+            maxTokens: OPENAI_MAX_TOKENS,
+            temperature: 0.4
+        });
+    } catch (_e) {
+        if (DEBUG) console.log('[AI] fallo → usando fallback contextual');
+        reply = buildFallbackReply(lead);
+    }
+
+    const finalReply = (clamp.notice || '') + reply;
+    hist.push({ role: 'user', content: rawBody });
+    hist.push({ role: 'assistant', content: finalReply });
+    await setHistory(userWa, hist);
+
+    try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
+
+    try {
+        await sendTelegramText(`🧾 *Nuevo mensaje*\nDe: ${userWa}\n\n${finalReply}`);
+    } catch (e) {
+        console.error('[ADMIN] notify (free):', emsg(e));
+    }
+
+    return { finalReply };
+}
+
+// ================== Health ==================
+app.get('/health', async(req, res) => {
+    try {
+        const ping = await redis.ping();
+        return res.json({
+            ok: true,
+            time: new Date().toISOString(),
+            redis: ping === 'PONG',
+            ackMode: WHATSAPP_ACK ? 'ACK+REST' : 'TwiML',
+            model: process.env.OPENAI_MODEL
+        });
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: emsg(e) });
+    }
+});
+
+// ================== Inicio ==================
+app.listen(PORT, () => {
+    console.log(
+        'Server on http://localhost:' + PORT,
+        '| TZ=', TIMEZONE,
+        '| ACK=', WHATSAPP_ACK ? 'ON' : 'OFF',
+        '| UnlimitedInput=', UNLIMITED_INPUT ? 'YES' : 'NO',
+        '| ClearOnCart=', CLEAR_ON_NEW_CART ? 'YES' : 'NO'
+    );
+});
+
+// ================== Salida limpia ==================
+process.on('SIGINT', async() => {
+    try { await redis.quit(); } catch {}
+    console.log('[EXIT] SIGINT');
+    process.exit(0);
+});
+process.on('SIGTERM', async() => {
+    try { await redis.quit(); } catch {}
+    console.log('[EXIT] SIGTERM');
+    process.exit(0);
+});
+
+// === Media download helper (usado solo para Twilio antes; lo dejamos por si lo reutilizas) ===
+async function downloadTwilioMedia(url, outDir) {
+    try {
+        if (!url) return null;
+        if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+        const fileName = Date.now() + '-' + path.basename(url.split('?')[0]);
+        const outPath = path.join(outDir, fileName);
+        const resp = await axios.get(url, {
+            responseType: 'stream',
+            auth: {
+                username: process.env.TWILIO_ACCOUNT_SID,
+                password: process.env.TWILIO_AUTH_TOKEN
+            },
+            timeout: 20000,
+        });
+        await new Promise((resolve, reject) => {
+            const ws = fs.createWriteStream(outPath);
+            resp.data.pipe(ws);
+            ws.on('finish', resolve);
+            ws.on('error', reject);
+        });
+        return outPath;
+    } catch (e) {
+        console.error('[MEDIA] download error:', e && e.message ? e.message : e);
+        return null;
+    }
+}
+
+// ================== Redis helpers ==================
+const keyHistory = (waId) => `chat:wa:${waId}:history`;
+const keyLead = (waId) => `lead:${waId}`;
+
+async function getHistory(waId) {
+    try {
+        const raw = await redis.get(keyHistory(waId));
+        return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] getHistory]:', emsg(e));
+        return [];
+    }
+}
+
+async function setHistory(waId, history) {
+    try {
+        const trimmed = history.slice(-40);
+        await redis.set(keyHistory(waId), JSON.stringify(trimmed), 'EX', TTL_SECONDS);
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] setHistory:', emsg(e));
+    }
+}
+
+async function getLead(waId) {
+    try {
+        const raw = await redis.get(keyLead(waId));
+        return raw ? JSON.parse(raw) : {};
+    } catch {
+        return {};
+    }
+}
+
+async function saveLead(waId, data) {
+    const prev = await getLead(waId);
+    const current = Object.assign({}, prev, data);
+    await redis.set(keyLead(waId), JSON.stringify(current), 'EX', 90 * 24 * 3600);
+    return current;
+}

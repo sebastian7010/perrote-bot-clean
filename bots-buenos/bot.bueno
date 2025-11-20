@@ -1,0 +1,834 @@
+// @ts-nocheck
+// ================== Boot & safety ==================
+process.on('uncaughtException', function (e) {
+  console.error('[uncaughtException]', (e && e.stack) || e);
+});
+process.on('unhandledRejection', function (e) {
+  console.error('[unhandledRejection]', (e && e.stack) || e);
+});
+
+// ================== Setup básico ==================
+require('dotenv').config();
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const twilio = require('twilio');
+const OpenAI = require('openai');
+const IORedis = require('ioredis');
+const nodemailer = require('nodemailer');
+const axios = require('axios');
+
+const app = express();
+// Twilio envía x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false }));
+
+// ================== Config ==================
+const PORT = process.env.PORT || 3008;
+const TIMEZONE = process.env.TIMEZONE || 'America/Bogota';
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '10000', 10);
+const OPENAI_MAX_ATTEMPTS = parseInt(process.env.OPENAI_MAX_ATTEMPTS || '3', 10);
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '1200', 10);
+
+const MAX_USER_CHARS = parseInt(process.env.MAX_USER_CHARS || '2000', 10);
+const HISTORY_MAX_TURNS = parseInt(process.env.HISTORY_MAX_TURNS || '12', 10);
+const UNLIMITED_INPUT = String(process.env.UNLIMITED_INPUT || '1') === '1';
+
+const WHATSAPP_ACK = String(process.env.WHATSAPP_ACK || '0') === '1'; // 0 = TwiML
+const TWIML_EMAIL_COPY = String(process.env.TWIML_EMAIL_COPY || '1') === '1';
+
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
+const BOT_NAME = process.env.BOT_NAME || 'Juan Marcos';
+const SALES_EMAIL = process.env.SALES_EMAIL || process.env.FROM_EMAIL || 'ventas@tolentinosftw.com';
+
+const DEBUG = String(process.env.DEBUG || '1') === '1';
+const EMAIL_ON = String(process.env.DISABLE_EMAIL || '0') !== '1';
+
+// ================== SDKs ==================
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+// ================== Redis ==================
+const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+const TTL_SECONDS = (parseInt(process.env.MEMORY_TTL_DAYS, 10) || 30) * 24 * 60 * 60;
+
+// Idempotencia y lock
+const IDEMP_TTL = 2 * 24 * 3600; // 48h
+const LOCK_TTL = 15;             // 15s lock por mensaje
+
+// ================== Mailer ==================
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+  auth: (process.env.SMTP_USER && process.env.SMTP_PASS) ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+});
+
+// ===== Helpers =====
+const emsg = (e) => (e && e.message) ? e.message : String(e);
+const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+
+function withTimeout(promise, ms) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { t = setTimeout(() => reject(new Error('TIMEOUT')), ms); })
+  ]).finally(() => clearTimeout(t));
+}
+
+function formatCOP(n) {
+  try { return '$' + Number(n).toLocaleString('es-CO'); } catch (_e) { return '$' + n; }
+}
+
+// Envío de email (wrapper seguro)
+async function sendEmail({ to, subject, text, html, attachments }) {
+  try {
+    if (!EMAIL_ON) return;
+    if (!to) to = process.env.ADMIN_EMAIL;
+    const info = await mailer.sendMail({
+      from: process.env.FROM_EMAIL || SALES_EMAIL,
+      to,
+      subject: subject || '(sin asunto)',
+      text: text || undefined,
+      html: html || undefined,
+      attachments: attachments || undefined
+    });
+    if (DEBUG) console.log('[MAIL] sent:', info.messageId);
+  } catch (e) {
+    console.error('[MAIL] error:', emsg(e));
+  }
+}
+
+// ================== Catálogo (JSON local) ==================
+const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
+let CATALOG = [];
+function loadCatalog() {
+  try {
+    CATALOG = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
+    if (DEBUG) console.log('[CATALOG] items:', CATALOG.length);
+  } catch (e) {
+    console.error('[CATALOG] error:', e.message);
+    CATALOG = [];
+  }
+}
+loadCatalog();
+
+function coalesce() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = arguments[i];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return null;
+}
+function getName(p) { return coalesce(p.name, p.Nombre, p.title, p.productName, p.nombre, p.titulo) || ''; }
+function getId(p) { return coalesce(p.id, p._id, p.sku, p.code, p.codigo, p.slug) || ''; }
+function getPriceRaw(p) { return coalesce(p.price, p.precio, p.unit_price, p.unitPrice, p.valor, p.cost, p.costo); }
+function parseCOPnum(v) { if (v == null) return null; const n = Number(String(v).replace(/[^\d.-]/g, '')); return Number.isFinite(n) ? n : null; }
+
+function normalize(t) { return (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function searchCatalog(q) {
+  q = (q || '').toLowerCase();
+  return CATALOG.filter(p => {
+    const txt = [
+      getName(p),
+      p.brand || p.marca || '',
+      p.category || p.categoria || '',
+      (p.tags || []).join(' ')
+    ].join(' ').toLowerCase();
+    return txt.includes(q);
+  }).slice(0, 10);
+}
+
+// ================== Parseo de carrito web ==================
+function parseWebCart(text) {
+  const out = { items: [], totalFromText: null };
+  if (!text) return out;
+  const blockRe = /\*([^*]+)\*\s*Cantidad:\s*(\d+)\s*Precio\s*unitario\s*:\s*([\$\d\.\,]+)\s*Subtotal\s*:\s*([\$\d\.\,]+)/gim;
+  let m;
+  while ((m = blockRe.exec(text)) !== null) {
+    const name = m[1].trim();
+    const qty = parseInt(m[2], 10);
+    const unit = parseCOPnum(m[3]);
+    const subtotal = parseCOPnum(m[4]);
+    if (!name || !Number.isFinite(qty) || !Number.isFinite(unit)) continue;
+    out.items.push({ name, qty, unit, subtotal: Number.isFinite(subtotal) ? subtotal : qty * unit });
+  }
+  const totalMatch = text.match(/Total\s*a\s*pagar\s*:\s*([\$\d\.\,]+)/i);
+  if (totalMatch) out.totalFromText = parseCOPnum(totalMatch[1]);
+  return out;
+}
+function looksLikeWebCart(text) {
+  if (!text) return false;
+  const a = /\*\s*[^*]+\s*\*\s*Cantidad:\s*\d+/i.test(text);
+  const b = /Precio\s*unitario\s*:\s*[\$\d\.\,]+/i.test(text);
+  const c = /Subtotal\s*:\s*[\$\d\.\,]+/i.test(text);
+  const d = /Total\s*a\s*pagar\s*:\s*[\$\d\.\,]+/i.test(text);
+  return (a && b && c) || d;
+}
+
+// ================== Envíos (reglas locales) ==================
+function inferCity(linesJoined) {
+  const t = normalize(linesJoined);
+  if (/\brionegro\b/.test(t)) return 'rionegro';
+  if (/\b(la\s*ceja|ceja)\b/.test(t)) return 'laceja';
+  if (/\bcarmen\b/.test(t) && /\bviboral\b/.test(t)) return 'carmenviboral';
+  if (/\bmedellin\b/.test(t)) return 'medellin';
+  return null;
+}
+function shippingForCity(cityKey) {
+  if (!cityKey) return { allowed: true, price: null, note: null };
+  if (cityKey === 'rionegro' || cityKey === 'laceja' || cityKey === 'carmenviboral') {
+    return { allowed: true, price: 12500, note: 'Envío local 12.500.' };
+  }
+  if (cityKey === 'medellin') {
+    return { allowed: true, price: 15000, note: 'Envío a Medellín 15.000.' };
+  }
+  return { allowed: false, price: null, note: 'Por ahora solo despachamos en Antioquia (Rionegro/La Ceja/Carmen/Medellín).' };
+}
+
+// ================== Prompt del bot ==================
+const systemPrompt =
+  (`
+Eres ${BOT_NAME}, asesor de ventas de "${COMPANY_NAME}".
+Tu meta: cerrar compra sin fricción y con tono natural.
+
+Reglas clave:
+- Responde de forma cálida y concreta (4–8 líneas).
+- Si el usuario envía un carrito (lista de productos con cantidades y precios), CONFIRMA ítems y TOTAL, ofrece pago y pide comprobante. Luego solicita datos de envío.
+- Métodos de pago (en este orden): Nequi {NEQUI}, Davivienda {DAVIVIENDA}, PSE {PSE}.
+- Datos de envío a solicitar (sin cédula/NIT ni horario si no lo ofrece): Nombre completo, Celular, Dirección, Apto/Casa, Barrio, Ciudad, Referencia (opcional).
+- Tiempos: “mismo día en ciudades principales; 24–48h resto; domingos/festivos sujeto a cobertura”.
+- Si falta variante (sabor/presentación), pregunta 1–2 cosas máximo.
+- No ofrezcas “buscar:” ni “responde con el número/id”.
+- Sé humano: evita frases robóticas; usa confirmaciones claras y amables.
+`).replace('{NEQUI}', process.env.PAY_NEQUI || '')
+  .replace('{DAVIVIENDA}', process.env.PAY_DAVIVIENDA || '')
+  .replace('{PSE}', process.env.PAY_PSE || '');
+
+// ================== Parseo y contexto ==================
+function parseLeadPieces(text) {
+  const out = {};
+  if (!text) return out;
+
+  const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (emailMatch) out.email = emailMatch[0];
+
+  const nameMatch = text.match(/\b(me llamo|mi nombre es)\s+([a-záéíóúñ ]{2,60})/i);
+  if (nameMatch) out.name = nameMatch[2].trim();
+
+  const phoneMatch = text.match(/\+?\d[\d\s-]{7,}/);
+  if (phoneMatch) out.phone = phoneMatch[0].replace(/\s+/g, '');
+
+  return out;
+}
+function parseShippingPieces(text) {
+  const out = {};
+  if (!text) return out;
+
+  const dirMatch = text.match(/\b(direcci[oó]n|dir)\s*[:\-]?\s*([^,\n]{5,100})/i);
+  if (dirMatch) out.address = dirMatch[2].trim();
+
+  const aptMatch = text.match(/\b(apartamento|apto|apt\.?|casa)\s*[:\-]?\s*([A-Za-z0-9\-]{1,10})/i);
+  if (aptMatch) out.apartment = aptMatch[2].trim();
+
+  const barrioMatch = text.match(/\b(barrio)\s*[:\-]?\s*([^,\n]{3,60})/i);
+  if (barrioMatch) out.neighborhood = barrioMatch[2].trim();
+
+  const cityMatch = text.match(/\b(ciudad)\s*[:\-]?\s*([^,\n]{3,60})/i);
+  if (cityMatch) out.city = cityMatch[2].trim();
+
+  const refMatch = text.match(/\b(referencia)\s*[:\-]?\s*([^,\n]{3,120})/i);
+  if (refMatch) out.reference = refMatch[2].trim();
+
+  const hourMatch = text.match(/\b(\d{1,2})\s*(am|pm)\b/i);
+  if (hourMatch) {
+    let h = parseInt(hourMatch[1], 10);
+    const suf = hourMatch[2].toLowerCase();
+    if (suf === 'pm' && h < 12) h += 12;
+    out.preferredHour = (h >= 0 && h <= 23) ? h : undefined;
+  }
+
+  return out;
+}
+function clampInput(text) {
+  if (!text) return { text: '', notice: '' };
+  if (UNLIMITED_INPUT) return { text: text, notice: '' };
+  if (text.length <= MAX_USER_CHARS) return { text, notice: '' };
+
+  const lines = text.split(/\r?\n/);
+  const kept = [];
+  for (let i = 0; i < lines.length; i++) {
+    const ln = String(lines[i]);
+    if (/^\s*(-|\d+[\).\s])/.test(ln)) kept.push(ln.trim());
+    if (kept.join('\n').length > MAX_USER_CHARS) break;
+  }
+  let final = kept.join('\n');
+  if (!final) final = text.slice(0, MAX_USER_CHARS);
+  const notice = '✂️ Tu mensaje era muy largo; lo resumí para responder ágilmente.\n\n';
+  return { text: final, notice };
+}
+function pickRecentHistory(hist) {
+  if (!Array.isArray(hist)) return [];
+  const trimmed = hist.slice(-HISTORY_MAX_TURNS * 2);
+  let out = [];
+  let total = 0;
+  const BUDGET = 8000; // chars aprox
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const m = trimmed[i];
+    const len = m && m.content ? m.content.length : 0;
+    if (total + len > BUDGET) break;
+    out.unshift(m);
+    total += len;
+  }
+  return out;
+}
+function formatFallbackSummary() {
+  return '¿Me confirmas los productos y cantidades? También puedes enviarme el comprobante (foto) y la dirección de envío.';
+}
+
+// ================== OpenAI (timeout + reintentos) ==================
+async function askOpenAI(messages, opts) {
+  opts = opts || {};
+  const model = opts.model || OPENAI_MODEL;
+  const maxTokens = opts.maxTokens || OPENAI_MAX_TOKENS;
+  const temperature = typeof opts.temperature === 'number' ? opts.temperature : 0.4;
+
+  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+    try {
+      if (DEBUG) console.log('[AI] intento', attempt, '| msgs=', messages.length);
+      const resp = await withTimeout(
+        openai.chat.completions.create({ model, messages, temperature, max_tokens: maxTokens }),
+        OPENAI_TIMEOUT_MS
+      );
+      const ok = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (ok) {
+        const text = String(resp.choices[0].message.content).trim();
+        if (DEBUG) console.log('[AI] OK len=', text.length);
+        return text;
+      }
+      throw new Error('Respuesta vacía de OpenAI');
+    } catch (e) {
+      console.error('[AI] error intento', attempt, ':', emsg(e));
+      if (attempt === OPENAI_MAX_ATTEMPTS) throw e;
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+    }
+  }
+}
+
+// ===== Twilio media from request =====
+function getMediaUrlsFromRequest(req) {
+  const out = [];
+  const num = Number((req && req.body && req.body.NumMedia) ? req.body.NumMedia : 0);
+  for (let i = 0; i < num; i++) {
+    const url = (req && req.body) ? req.body['MediaUrl' + i] : null;
+    const ctype = (req && req.body) ? req.body['MediaContentType' + i] : null;
+    if (url) out.push({ url: String(url), contentType: String(ctype || '') });
+  }
+  return out;
+}
+
+// ===== Archivo resumen pedido =====
+function writeOrderFile({ wa, finalReply, body, lead, media }) {
+  try {
+    const dir = path.join(__dirname, 'orders');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(dir, `${ts}__${(wa || '').replace(/[^+\d]/g, '')}.md`);
+    const lines = [];
+    lines.push(
+      `# Pedido de ${wa || '-'} (${ts})`,
+      ``,
+      `## Resumen generado para el cliente`,
+      finalReply || '(vacío)',
+      ``,
+      '## Mensaje original del cliente',
+      body || '(vacío)',
+      ``,
+      '## Datos de envío (si disponibles)',
+      '- Nombre: ' + ((lead && lead.name) || '-'),
+      '- Celular: ' + ((lead && lead.phone) || '-'),
+      '- Dirección: ' + ((lead && lead.address) || '-'),
+      '- Apto/Casa: ' + ((lead && lead.apartment) || '-'),
+      '- Barrio: ' + ((lead && lead.neighborhood) || '-'),
+      '- Ciudad: ' + ((lead && lead.city) || '-'),
+      '- Referencia (opcional): ' + ((lead && lead.reference) || '-'),
+      '- Horario preferido: ' + ((lead && lead.preferredHour != null) ? (String(lead.preferredHour).padStart(2, '0') + ':00') : '-'),
+      ``,
+      '## Comprobantes (imágenes enviadas)'
+    );
+    if (media && media.length) {
+      media.forEach((m, i) => lines.push(`- #${i + 1}: ${m.url} (${m.contentType || 'image'})`));
+    } else {
+      lines.push('(sin adjuntos)');
+    }
+    fs.writeFileSync(file, lines.join('\n'), 'utf8');
+    return file;
+  } catch (e) { console.error('[FILE] writeOrderFile:', emsg(e)); return null; }
+}
+
+// === Enviar WhatsApp con (opcional) media — CON DEDUP ===
+const DEDUP_TTL_SECONDS = 120; // 2 minutos
+async function sendWhatsAppOnce(to, body, mediaUrls = []) {
+  try {
+    if (!to || !body) return null;
+    const payloadKey = `sent:${to}:${sha1(body)}`;
+    const first = await redis.set(payloadKey, '1', 'NX', 'EX', DEDUP_TTL_SECONDS);
+    if (first === null) {
+      if (DEBUG) console.log('[WA] dedup: ya se envió ese texto recientemente a', to);
+      return null;
+    }
+    const payload = { from: process.env.TWILIO_WHATSAPP_FROM, to, body };
+    if (Array.isArray(mediaUrls) && mediaUrls.length) payload.mediaUrl = mediaUrls.slice(0, 10);
+    const msg = await twilioClient.messages.create(payload);
+    if (DEBUG) console.log('[WA] sent', msg.sid, '->', to);
+    return msg.sid;
+  } catch (e) {
+    console.error('[WA] error]:', emsg(e));
+    return null;
+  }
+}
+
+// ================== Endpoints ==================
+app.post('/twilio-status', express.urlencoded({ extended: false }), function (req, res) {
+  const sid = (req.body && req.body.MessageSid) || '';
+  const status = (req.body && (req.body.MessageStatus || req.body.SmsStatus)) || '';
+  const to = (req.body && req.body.To) || '';
+  const errorCode = (req.body && req.body.ErrorCode) || '';
+  const errorMsg = (req.body && req.body.ErrorMessage) || '';
+  console.log('[STATUS]', sid, '| to=', to, '| status=', status, '| err=', errorCode, errorMsg);
+  res.sendStatus(200);
+});
+
+app.post('/whatsapp', async function (req, res) {
+  const MessagingResponse = twilio.twiml.MessagingResponse;
+
+  // ====== IDEMPOTENCIA POR MessageSid ======
+  const messageSid = String((req.body && (req.body.MessageSid || req.body.SmsSid)) || '');
+  const from = (req && req.body && req.body.From) ? String(req.body.From) : '';
+  const body = (req && req.body && req.body.Body) ? String(req.body.Body).trim() : '';
+  const media = getMediaUrlsFromRequest(req);
+
+  // Si no llega MessageSid, generamos uno con hash (from + primera línea)
+  const fallbackId = messageSid || ('FAKE-' + sha1(from + '|' + body.slice(0, 64)));
+  const seenKey = `seen:msg:${fallbackId}`;
+  const lockKey = `lock:msg:${fallbackId}`;
+
+  try {
+    // SET NX para procesar este mensaje solo 1 vez
+    const firstTime = await redis.set(seenKey, '1', 'NX', 'EX', IDEMP_TTL);
+    if (firstTime === null) {
+      // Ya se procesó antes → contestamos vacío/200
+      if (!WHATSAPP_ACK) {
+        const tw = new MessagingResponse();
+        return res.type('text/xml').send(tw.toString());
+      } else {
+        return res.sendStatus(200);
+      }
+    }
+
+    // Lock anti-carrera (dos workers al tiempo)
+    const gotLock = await redis.set(lockKey, '1', 'NX', 'EX', LOCK_TTL);
+    if (gotLock === null) {
+      // Otro proceso está respondiendo; respondemos vacío
+      if (!WHATSAPP_ACK) {
+        const tw = new MessagingResponse();
+        return res.type('text/xml').send(tw.toString());
+      } else {
+        return res.sendStatus(200);
+      }
+    }
+
+    if (DEBUG) console.log('IN >>', from, '|', body.slice(0, 140), '... | media:', media.length, '| sid=', fallbackId);
+
+    // ---- Procesar conversación una sola vez ----
+    const result = await processConversation(from, body, media);
+    const out = (result && result.finalReply) ? result.finalReply : '¡Gracias! Ya mismo te confirmo por aquí.';
+
+    if (!WHATSAPP_ACK) {
+      // Respuesta por TwiML
+      if (TWIML_EMAIL_COPY && EMAIL_ON) {
+        const emailKey = `sent:twimlcopy:${(process.env.ADMIN_EMAIL||'')}:${sha1(from+'|'+out)}`;
+        const firstMail = await redis.set(emailKey, '1', 'NX', 'EX', 300); // 5 min
+        if (firstMail) {
+          await sendEmail({
+            to: process.env.ADMIN_EMAIL,
+            subject: 'Copia de respuesta (TwiML) - ' + COMPANY_NAME,
+            text: 'Destino: ' + from + '\n\n' + out
+          });
+        } else if (DEBUG) {
+          console.log('[MAIL] dedup: copia TwiML ya enviada recientemente');
+        }
+      }
+      const tw = new MessagingResponse();
+      const msg = tw.message({ statusCallback: process.env.TWILIO_STATUS_CALLBACK || undefined });
+      msg.body(out);
+      return res.type('text/xml').send(tw.toString());
+    } else {
+      // Modo ACK: respondemos 200 OK y enviamos por REST (una sola vez, con dedup)
+      await sendWhatsAppOnce(from, out);
+      return res.sendStatus(200);
+    }
+  } catch (err) {
+    console.error('Error /whatsapp:', emsg(err));
+    try {
+      if (!WHATSAPP_ACK) {
+        const twimlErr = new MessagingResponse();
+        twimlErr.message('Ups, hubo un problema. Intenta de nuevo en unos segundos 🙏');
+        return res.type('text/xml').send(twimlErr.toString());
+      } else {
+        return res.sendStatus(200);
+      }
+    } catch (_e) {
+      return res.sendStatus(200);
+    }
+  }
+});
+
+// ================== Core de conversación ==================
+async function processConversation(userWa, rawBody, media = []) {
+  const hist = await getHistory(userWa);
+  let lead = await getLead(userWa);
+
+  // Capturar datos si vienen en texto
+  const pieces = parseLeadPieces(rawBody);
+  const ship = parseShippingPieces(rawBody);
+  const gotAnyLead = !!(pieces.name || pieces.email || pieces.phone);
+  const gotAnyShip = Object.keys(ship).length > 0;
+  if (gotAnyLead || gotAnyShip || (media && media.length)) {
+    lead = await saveLead(userWa, Object.assign({}, lead, pieces, ship, {
+      paymentProofs: (lead && Array.isArray(lead.paymentProofs) ? lead.paymentProofs : []).concat(media || [])
+    }));
+    if (DEBUG) console.log('[LEAD] actualizado:', lead);
+  }
+
+  const trimmed = (rawBody || '').trim();
+
+  // ===== 0) Si es carrito web, PASA DIRECTO a resumen/pago/datos (sin discovery) =====
+  const isCart = looksLikeWebCart(trimmed);
+  if (isCart) {
+    const parsed = parseWebCart(trimmed);
+
+    // Construir resumen humano
+    let total = 0;
+    const lines = [];
+    parsed.items.forEach((it, idx) => {
+      const line = `${idx + 1}. *${it.name}* · Cantidad: ${it.qty} · ${formatCOP(it.unit)} = ${formatCOP(it.subtotal)}`;
+      lines.push(line);
+      total += (it.subtotal || (it.qty * it.unit));
+    });
+    if (parsed.totalFromText != null && Math.abs(parsed.totalFromText - total) < 2000) {
+      total = parsed.totalFromText; // confía si coincide
+    }
+
+    // Costo de envío según ciudad (si ya la mencionó en el mismo texto o previamente)
+    const cityHint = inferCity([trimmed, lead && lead.city || ''].join(' '));
+    const shipInfo = shippingForCity(cityHint);
+    let envioLinea = '';
+    if (shipInfo.allowed && shipInfo.price != null) {
+      envioLinea = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
+    } else if (shipInfo.allowed === false) {
+      envioLinea = `\n${(lines.length + 1)}. *Envío*: ${shipInfo.note}`;
+    }
+
+    const header = `Gracias por tu pedido, aquí tienes el resumen:\n\n${lines.join('\n')}${envioLinea}\n\n*Total a pagar:* ${formatCOP(total)}${shipInfo.price ? ' + envío' : ''}`;
+
+    const pagos =
+      `\nPor favor, indícame tu método de pago y envíame el comprobante:\n` +
+      `- *Nequi:* ${process.env.PAY_NEQUI || ''}\n` +
+      `- *Davivienda:* ${process.env.PAY_DAVIVIENDA || ''}\n` +
+      `- *PSE:* ${process.env.PAY_PSE || ''}`;
+
+    const faltanDatos = !lead.address || !lead.neighborhood || !lead.city || !lead.phone || !lead.name;
+    const pedirDatos = `\n\nLuego, para el despacho, confírmame por favor:\n` +
+      `• Nombre completo\n` +
+      `• Celular\n` +
+      `• Dirección + Apto/Casa\n` +
+      `• Barrio\n` +
+      `• Ciudad\n` +
+      `• Referencia (opcional)\n` +
+      `• Horario preferido (entre 8am y 3pm)\n`;
+
+    const finalReply = header + pagos + (faltanDatos ? pedirDatos : '\n\n¡Apenas reciba el comprobante, programo el despacho!');
+
+    // Persistir historial
+    hist.push({ role: 'user', content: rawBody });
+    hist.push({ role: 'assistant', content: finalReply });
+    await setHistory(userWa, hist);
+
+    // Descarga de media (comprobantes) — sólo si vinieron en ESTE mensaje
+    const downloaded = [];
+    if (String(process.env.MEDIA_DOWNLOAD || '0') === '1' && media && media.length) {
+      const dir = path.join(__dirname, 'orders', 'media');
+      for (const m of media) {
+        const p = await downloadTwilioMedia(m.url, dir);
+        if (p) downloaded.push({ path: p, contentType: m.contentType });
+      }
+    }
+
+    // Archivo + correo
+    const filePath = writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media });
+    try {
+      const mediaLines = (media && media.length)
+        ? media.map((m, i) => `#${i + 1}: ${m.url} (${m.contentType || 'image'})`).join('\n')
+        : '(sin adjuntos)';
+
+      const attachments = [];
+      if (filePath) attachments.push({ filename: path.basename(filePath), path: filePath });
+      if (downloaded && downloaded.length) {
+        for (const d of downloaded) {
+          attachments.push({ filename: path.basename(d.path), path: d.path, contentType: d.contentType || undefined });
+        }
+      }
+
+      await sendEmail({
+        to: process.env.ADMIN_EMAIL,
+        subject: '🧾 Pedido/Comprobante por WhatsApp',
+        text:
+          'WA: ' + userWa + '\n\n' +
+          '=== Respuesta enviada al cliente ===\n' + finalReply + '\n\n' +
+          '=== Mensaje original ===\n' + rawBody + '\n\n' +
+          '=== Datos de envío ===\n' +
+          'Nombre: ' + ((lead && lead.name) || '-') + '\n' +
+          'Celular: ' + ((lead && lead.phone) || '-') + '\n' +
+          'Dirección: ' + ((lead && lead.address) || '-') + '\n' +
+          'Apto/Casa: ' + ((lead && lead.apartment) || '-') + '\n' +
+          'Barrio: ' + ((lead && lead.neighborhood) || '-') + '\n' +
+          'Ciudad: ' + ((lead && lead.city) || '-') + '\n' +
+          'Referencia: ' + ((lead && lead.reference) || '-') + '\n' +
+          'Horario preferido: ' + ((lead && lead.preferredHour != null) ? (String(lead.preferredHour).padStart(2, '0') + ':00') : '-') + '\n\n' +
+          '=== Comprobantes ===\n' + mediaLines + '\n',
+        attachments
+      });
+    } catch (e) {
+      console.error('[MAIL] notify order]:', emsg(e));
+    }
+
+    // Notificación al admin por WhatsApp (texto + imágenes) — evitando duplicados y eco al cliente
+    try {
+      const adminTo = process.env.ADMIN_WA;
+      if (adminTo && adminTo !== userWa) {
+        await sendWhatsAppOnce(adminTo, `🧾 *Nuevo pedido/comprobante*\nDe: ${userWa}\n\n${finalReply}`);
+        if (media && media.length) {
+          const urls = media.map(m => m.url);
+          for (let i = 0; i < urls.length; i += 10) {
+            const chunk = urls.slice(i, i + 10);
+            await sendWhatsAppOnce(adminTo, '📎 Comprobante(s) adjunto(s)', chunk);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[WA->ADMIN] notify error]:', emsg(e));
+    }
+
+    return { finalReply };
+  }
+
+  // ===== 1) Saludos → discovery SOLO si NO es carrito =====
+  const isSimpleGreeting = /^(hola|buen[oa]s|hey|holi)\b/i.test(trimmed);
+  if (isSimpleGreeting) {
+    const replyDiscovery =
+      `¡Hola! Soy ${BOT_NAME} de ${COMPANY_NAME} 🐶🐱\n` +
+      `Cuéntame: ¿qué mascota tienes (perro/gato, raza), edad/tamaño y qué necesitas hoy? ` +
+      `Te sugiero lo ideal y armamos el pedido de una.`;
+    return { finalReply: replyDiscovery };
+  }
+
+  // ===== 2) IA para casos libres (sin carrito) =====
+  const clamp = clampInput(rawBody);
+  const recentHist = pickRecentHistory(hist);
+  const messages = [
+    {
+      role: 'system',
+      content:
+        `Si el usuario describe necesidad (mascota/edad/tamaño/problema) pero no manda carrito, ` +
+        `haz 1–2 preguntas cortas de clarificación y sugiere 1–3 productos del catálogo si la intención es clara. ` +
+        `No inventes precios: si no conoces el precio exacto, di "Consultar". Usa tono humano (sin "responde con número", sin "buscar:").`
+    },
+    { role: 'system', content: systemPrompt }
+  ].concat(recentHist).concat([{ role: 'user', content: clamp.text }]);
+
+  let reply;
+  try {
+    reply = await askOpenAI(messages, { model: OPENAI_MODEL, maxTokens: OPENAI_MAX_TOKENS, temperature: 0.4 });
+  } catch (_e) {
+    if (DEBUG) console.log('[AI] usando fallback local');
+    reply = formatFallbackSummary(rawBody);
+  }
+
+  // Persistir historial
+  hist.push({ role: 'user', content: rawBody });
+  hist.push({ role: 'assistant', content: (clamp.notice || '') + reply });
+  await setHistory(userWa, hist);
+
+  const finalReply = (clamp.notice || '') + reply;
+
+  // === Descarga local de comprobantes (scope por request) ===
+  const downloaded = [];
+  if (String(process.env.MEDIA_DOWNLOAD || '0') === '1' && media && media.length) {
+    const dir = path.join(__dirname, 'orders', 'media');
+    for (const m of media) {
+      const p = await downloadTwilioMedia(m.url, dir);
+      if (p) downloaded.push({ path: p, contentType: m.contentType });
+    }
+  }
+
+  // === Archivo + correo con resumen, datos y comprobantes ===
+  const filePath = writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media });
+  try {
+    const mediaLines = (media && media.length)
+      ? media.map((m, i) => `#${i + 1}: ${m.url} (${m.contentType || 'image'})`).join('\n')
+      : '(sin adjuntos)';
+
+    const attachments = [];
+    if (filePath) attachments.push({ filename: path.basename(filePath), path: filePath });
+    if (downloaded && downloaded.length) {
+      for (const d of downloaded) {
+        attachments.push({ filename: path.basename(d.path), path: d.path, contentType: d.contentType || undefined });
+      }
+    }
+
+    await sendEmail({
+      to: process.env.ADMIN_EMAIL,
+      subject: '🧾 Pedido/Comprobante por WhatsApp',
+      text:
+        'WA: ' + userWa + '\n\n' +
+        '=== Respuesta enviada al cliente ===\n' + finalReply + '\n\n' +
+        '=== Mensaje original ===\n' + rawBody + '\n\n' +
+        '=== Datos de envío ===\n' +
+        'Nombre: ' + ((lead && lead.name) || '-') + '\n' +
+        'Celular: ' + ((lead && lead.phone) || '-') + '\n' +
+        'Dirección: ' + ((lead && lead.address) || '-') + '\n' +
+        'Apto/Casa: ' + ((lead && lead.apartment) || '-') + '\n' +
+        'Barrio: ' + ((lead && lead.neighborhood) || '-') + '\n' +
+        'Ciudad: ' + ((lead && lead.city) || '-') + '\n' +
+        'Referencia: ' + ((lead && lead.reference) || '-') + '\n' +
+        'Horario preferido: ' + ((lead && lead.preferredHour != null) ? (String(lead && lead.preferredHour).padStart(2, '0') + ':00') : '-') + '\n\n' +
+        '=== Comprobantes ===\n' + mediaLines + '\n',
+      attachments
+    });
+  } catch (e) {
+    console.error('[MAIL] notify order]:', emsg(e));
+  }
+
+  // --- Notificación por WhatsApp al admin ---
+  try {
+    const adminTo = process.env.ADMIN_WA;
+    if (adminTo && adminTo !== userWa) {
+      await sendWhatsAppOnce(adminTo, `🧾 *Nuevo mensaje*\nDe: ${userWa}\n\n${finalReply}`);
+      if (media && media.length) {
+        const urls = media.map(m => m.url);
+        for (let i = 0; i < urls.length; i += 10) {
+          const chunk = urls.slice(i, i + 10);
+          await sendWhatsAppOnce(adminTo, '📎 Comprobante(s) adjunto(s)', chunk);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[WA->ADMIN] notify error]:', emsg(e));
+  }
+
+  return { finalReply };
+}
+
+// ================== Health ==================
+app.get('/health', async (req, res) => {
+  try {
+    const ping = await redis.ping();
+    return res.json({
+      ok: true,
+      time: new Date().toISOString(),
+      redis: ping === 'PONG',
+      ackMode: WHATSAPP_ACK ? 'ACK+REST' : 'TwiML',
+      model: process.env.OPENAI_MODEL
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: emsg(e) });
+  }
+});
+
+// ================== Inicio ==================
+app.listen(PORT, function () {
+  console.log(
+    'Server on http://localhost:' + PORT,
+    '| TZ=', TIMEZONE,
+    '| ACK=', WHATSAPP_ACK ? 'ON' : 'OFF',
+    '| UnlimitedInput=', UNLIMITED_INPUT ? 'YES' : 'NO'
+  );
+});
+
+// ================== Salida limpia ==================
+process.on('SIGINT', async function () {
+  try { await redis.quit(); } catch (_e) { }
+  console.log('[EXIT] SIGINT');
+  process.exit(0);
+});
+process.on('SIGTERM', async function () {
+  try { await redis.quit(); } catch (_e) { }
+  console.log('[EXIT] SIGTERM');
+  process.exit(0);
+});
+
+// === Media download helper ===
+async function downloadTwilioMedia(url, outDir) {
+  try {
+    if (!url) return null;
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    const fileName = Date.now() + '-' + path.basename(url.split('?')[0]);
+    const outPath = path.join(outDir, fileName);
+
+    const resp = await axios.get(url, {
+      responseType: 'stream',
+      auth: {
+        username: process.env.TWILIO_ACCOUNT_SID,
+        password: process.env.TWILIO_AUTH_TOKEN,
+      },
+      timeout: 20000,
+    });
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(outPath);
+      resp.data.pipe(ws);
+      ws.on('finish', resolve);
+      ws.on('error', reject);
+    });
+    return outPath;
+  } catch (e) {
+    console.error('[MEDIA] download error:', e && e.message ? e.message : e);
+    return null;
+  }
+}
+
+// ================== Redis helpers ==================
+const keyHistory = (waId) => `chat:wa:${waId}:history`;
+const keyLead = (waId) => `lead:${waId}`;
+
+async function getHistory(waId) {
+  try {
+    const raw = await redis.get(keyHistory(waId));
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    if (DEBUG) console.error('[REDIS] getHistory]:', emsg(e));
+    return [];
+  }
+}
+async function setHistory(waId, history) {
+  try {
+    const trimmed = history.slice(-40);
+    await redis.set(keyHistory(waId), JSON.stringify(trimmed), 'EX', TTL_SECONDS);
+  } catch (e) {
+    if (DEBUG) console.error('[REDIS] setHistory:', emsg(e));
+  }
+}
+async function getLead(waId) {
+  try {
+    const raw = await redis.get(keyLead(waId));
+    return raw ? JSON.parse(raw) : {};
+  } catch (_e) { return {}; }
+}
+async function saveLead(waId, data) {
+  const prev = await getLead(waId);
+  const current = Object.assign({}, prev, data);
+  await redis.set(keyLead(waId), JSON.stringify(current), 'EX', 90 * 24 * 3600);
+  return current;
+}

@@ -1,0 +1,910 @@
+// @ts-nocheck
+// ================== Boot & safety ==================
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', (e && e.stack) || e));
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', (e && e.stack) || e));
+
+// ================== Setup básico ==================
+require('dotenv').config();
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const twilio = require('twilio');
+const OpenAI = require('openai');
+const IORedis = require('ioredis');
+const nodemailer = require('nodemailer');
+const axios = require('axios');
+const FormData = require('form-data');
+
+const app = express();
+app.use(express.urlencoded({ extended: false })); // Twilio envía x-www-form-urlencoded
+
+// ================== Config ==================
+const PORT = process.env.PORT || 3008;
+const TIMEZONE = process.env.TIMEZONE || 'America/Bogota';
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '6000', 10);
+const OPENAI_MAX_ATTEMPTS = parseInt(process.env.OPENAI_MAX_ATTEMPTS || '1', 10);
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '1200', 10);
+
+const MAX_USER_CHARS = parseInt(process.env.MAX_USER_CHARS || '2000', 10);
+const HISTORY_MAX_TURNS = parseInt(process.env.HISTORY_MAX_TURNS || '6', 10);
+const UNLIMITED_INPUT = String(process.env.UNLIMITED_INPUT || '1') === '1';
+
+const WHATSAPP_ACK = String(process.env.WHATSAPP_ACK || '0') === '1'; // 0 = TwiML
+const TWIML_EMAIL_COPY = String(process.env.TWIML_EMAIL_COPY || '0') === '1';
+
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
+const BOT_NAME = process.env.BOT_NAME || 'Juan';
+const SALES_EMAIL = process.env.SALES_EMAIL || process.env.FROM_EMAIL || 'ventas@tolentinosftw.com';
+
+const DEBUG = String(process.env.DEBUG || '1') === '1';
+const EMAIL_ON = String(process.env.DISABLE_EMAIL || '0') !== '1';
+
+// ================== SDKs ==================
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+// ================== Redis ==================
+const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+const TTL_SECONDS = (parseInt(process.env.MEMORY_TTL_DAYS, 10) || 30) * 24 * 60 * 60;
+
+// Idempotencia y lock
+const IDEMP_TTL = 2 * 24 * 3600; // 48h
+const LOCK_TTL = 3; // 3s lock por mensaje (evita carreras/silencios)
+
+// ================== Mailer ==================
+const mailer = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    auth: process.env.SMTP_USER && process.env.SMTP_PASS ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+});
+
+// ===== Helpers =====
+const emsg = (e) => (e && e.message) ? e.message : String(e);
+const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+
+function withTimeout(promise, ms) {
+    let t;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => { t = setTimeout(() => reject(new Error('TIMEOUT')), ms); }),
+    ]).finally(() => clearTimeout(t));
+}
+
+// — COP: convierte "35.000" o "40,400" a 35000 / 40400
+function parseCOPnum(v) {
+    if (v == null) return null;
+    const digits = String(v).replace(/[^\d]/g, ''); // deja solo dígitos
+    const n = Number(digits);
+    return Number.isFinite(n) ? n : null;
+}
+
+function formatCOP(n) {
+    try { return '$' + Number(n).toLocaleString('es-CO'); } catch (_e) { return '$' + n; }
+}
+
+// Envío de email (wrapper seguro)
+async function sendEmail({ to, subject, text, html, attachments }) {
+    try {
+        if (!EMAIL_ON) return;
+        if (!to) to = process.env.ADMIN_EMAIL;
+        if (!to) return;
+        const info = await mailer.sendMail({
+            from: process.env.FROM_EMAIL || SALES_EMAIL,
+            to,
+            subject: subject || '(sin asunto)',
+            text: text || undefined,
+            html: html || undefined,
+            attachments: attachments || undefined,
+        });
+        if (DEBUG) console.log('[MAIL] sent:', info.messageId);
+    } catch (e) {
+        console.error('[MAIL] error:', emsg(e));
+    }
+}
+
+// Telegram: enviar fotos
+async function sendTelegramPhotos(paths = [], caption = '') {
+    try {
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if (!token || !chatId) return false;
+        for (let i = 0; i < paths.length; i++) {
+            const fd = new FormData();
+            fd.append('chat_id', chatId);
+            if (i === 0 && caption) fd.append('caption', caption);
+            fd.append('photo', fs.createReadStream(paths[i]));
+            await axios.post(`https://api.telegram.org/bot${token}/sendPhoto`, fd, {
+                headers: fd.getHeaders(),
+                timeout: 20000,
+            });
+        }
+        return true;
+    } catch (e) {
+        console.error('[TG] sendPhoto error:', e && e.message ? e.message : e);
+        return false;
+    }
+}
+
+// ================== Catálogo (JSON local) ==================
+const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
+let CATALOG = [];
+
+function loadCatalog() {
+    try {
+        CATALOG = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
+        if (DEBUG) console.log('[CATALOG] items:', CATALOG.length);
+    } catch (e) {
+        console.error('[CATALOG] error:', e.message);
+        CATALOG = [];
+    }
+}
+loadCatalog();
+
+function coalesce() {
+    for (let i = 0; i < arguments.length; i++) {
+        const v = arguments[i];
+        if (v !== undefined && v !== null && v !== '') return v;
+    }
+    return null;
+}
+
+function getName(p) { return coalesce(p.name, p.Nombre, p.title, p.productName, p.nombre, p.titulo) || ''; }
+
+function getId(p) { return coalesce(p.id, p._id, p.sku, p.code, p.codigo, p.slug) || ''; }
+
+function getPriceRaw(p) { return coalesce(p.price, p.precio, p.unit_price, p.unitPrice, p.valor, p.cost, p.costo); }
+
+function searchCatalog(q) {
+    q = (q || '').toLowerCase();
+    return CATALOG.filter(p => {
+        const txt = [getName(p), p.brand || p.marca || '', p.category || p.categoria || '', (p.tags || []).join(' ')].join(' ').toLowerCase();
+        return txt.includes(q);
+    }).slice(0, 10);
+}
+
+// ================== Parseo de carrito web ==================
+function parseWebCart(text) {
+    const out = { items: [], totalFromText: null };
+    if (!text) return out;
+    const blockRe = /\*([^*]+)\*\s*Cantidad:\s*(\d+)\s*Precio\s*unitario\s*:\s*([\$\d\.\,]+)\s*Subtotal\s*:\s*([\$\d\.\,]+)/gim;
+    let m;
+    while ((m = blockRe.exec(text)) !== null) {
+        const name = m[1].trim();
+        const qty = parseInt(m[2], 10);
+        const unit = parseCOPnum(m[3]);
+        const subtotal = parseCOPnum(m[4]);
+        if (!name || !Number.isFinite(qty) || !Number.isFinite(unit)) continue;
+        out.items.push({ name, qty, unit, subtotal: Number.isFinite(subtotal) ? subtotal : qty * unit });
+    }
+    const totalMatch = text.match(/Total\s*a\s*pagar\s*:\s*([\$\d\.\,]+)/i);
+    if (totalMatch) out.totalFromText = parseCOPnum(totalMatch[1]);
+    return out;
+}
+
+function looksLikeWebCart(text) {
+    if (!text) return false;
+    const a = /\*\s*[^*]+\s*\*\s*Cantidad:\s*\d+/i.test(text);
+    const b = /Precio\s*unitario\s*:\s*[\$\d\.\,]+/i.test(text);
+    const c = /Subtotal\s*:\s*[\$\d\.\,]+/i.test(text);
+    const d = /Total\s*a\s*pagar\s*:\s*[\$\d\.\,]+/i.test(text);
+    return (a && b && c) || d;
+}
+
+// ================== Envíos (reglas locales) ==================
+function normalize(t) { return (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+
+function inferCity(linesJoined) {
+    const t = normalize(linesJoined);
+    if (/\brionegro\b/.test(t)) return 'rionegro';
+    if (/\b(llano\s*grande|llanogrande)\b/.test(t)) return 'llanogrande';
+    if (/\bmarinilla\b/.test(t)) return 'marinilla';
+    if (/\b(la\s*ceja|ceja)\b/.test(t)) return 'laceja';
+    if (/\bcarmen\b/.test(t) && /\bviboral\b/.test(t)) return 'carmenviboral';
+    if (/\bmedellin\b/.test(t)) return 'medellin';
+    if (/\benvigado\b/.test(t)) return 'envigado';
+    if (/\bsabaneta\b/.test(t)) return 'sabaneta';
+    if (/\bbello\b/.test(t)) return 'bello';
+    if (/\bitag[uü]i\b/.test(t)) return 'itagui';
+    return null;
+}
+
+function shippingForCity(cityKey) {
+    // Antioquia only
+    if (!cityKey) return { allowed: null, price: null, note: 'Confírmame ciudad para calcular envío. Por ahora solo Antioquia.' };
+
+    // $12.500
+    if (['rionegro', 'llanogrande', 'marinilla', 'laceja', 'carmenviboral'].includes(cityKey))
+        return { allowed: true, price: 12500, note: 'Envío local 12.500.' };
+
+    // $15.000
+    if (['medellin', 'envigado', 'sabaneta', 'bello', 'itagui'].includes(cityKey))
+        return { allowed: true, price: 15000, note: 'Envío Área MDE 15.000.' };
+
+    // fuera de Antioquia ⇒ no vendemos
+    return { allowed: false, price: null, note: 'Por ahora solo despachamos en Antioquia.' };
+}
+
+// ================== Prompt del bot ==================
+const systemPrompt =
+    `
+Eres ${BOT_NAME}, asesor de ventas de "${COMPANY_NAME}". Siempre en español, cálido y concreto.
+
+Objetivo: cerrar la compra sin fricción.
+
+Reglas:
+- Si el usuario envía un carrito (lista con "Cantidad / Precio unitario / Subtotal"), responde con:
+  1) Resumen de ítems y total,
+  2) Métodos de pago (Nequi / Davivienda / BRE-B),
+  3) Solicita datos de envío (Nombre, Celular, Dirección + Apto/Casa, Barrio, Ciudad, Referencia opcional, Horario 8–15).
+- Si ya tengo datos de envío suficientes, NO pidas otra vez dirección/productos: SOLO solicita foto del comprobante.
+- Si llega la foto del comprobante, confirma pago y hora de entrega:
+   • Si el cliente dio hora: "Haremos lo posible por las HH:00; los envíos salen entre 8–15."
+   • Si no dio hora: "Lo despachamos hoy en la ventana 8–15."
+- Ciudades: Rionegro/La Ceja/Carmen/Llanogrande/Marinilla $12.500; Medellín/Envigado/Sabaneta/Bello/Itagüí $15.000; otros: por ahora solo Antioquia.
+- No pidas cédula/NIT.
+- Mantén 4–8 líneas máx. y evita tono robótico.
+`.trim();
+
+// ================== Parseo y contexto ==================
+
+// Utilidades de validación
+const CITIES = [
+    'rionegro', 'la ceja', 'carmen de viboral', 'carmen del viboral', 'llanogrande', 'marinilla',
+    'medellin', 'envigado', 'sabaneta', 'bello', 'itagüí', 'itagui'
+];
+
+function norm(s) { return (s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+
+function onlyDigits(s) { return (s || '').replace(/[^\d]/g, ''); }
+
+function capWords(s) { return (s || '').split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '); }
+
+function isLikelyName(s) {
+    const t = (s || '').trim();
+    if (!t) return false;
+    if (/\d|#/.test(t)) return false;
+    const words = t.split(/\s+/);
+    if (words.length < 2) return false;
+    if (words.some(w => w.length < 2)) return false;
+    return true;
+}
+
+function isLikelyAddress(s) {
+    const t = norm(s);
+    const hasKW = /(cra|cr|carrera|cll|calle|av|avenida|transv|transversal|diag|diagonal|mz|manzana|km|#)/.test(t);
+    const hasNum = /\d/.test(t);
+    return hasKW || (hasNum && /[#\-]/.test(t));
+}
+
+function isLikelyNeighborhood(s) {
+    const t = (s || '').trim();
+    if (!t) return false;
+    if (/\#|\d{2,}/.test(t)) return false;
+    if (t.length < 3 || t.length > 60) return false;
+    return true;
+}
+
+function findCityFreeform(lines) {
+    const joined = ' ' + lines.join(' ') + ' ';
+    const t = norm(joined);
+    const inf = inferCity(joined);
+    if (inf) {
+        const map = { rionegro: 'Rionegro', laceja: 'La Ceja', carmenviboral: 'Carmen de Viboral', llanogrande: 'Llanogrande', marinilla: 'Marinilla', medellin: 'Medellín', envigado: 'Envigado', sabaneta: 'Sabaneta', bello: 'Bello', itagui: 'Itagüí' };
+        return map[inf];
+    }
+    for (const c of CITIES) {
+        if (t.includes(' ' + norm(c) + ' ')) return capWords(c);
+    }
+    return undefined;
+}
+
+function parseHourFreeform(text) {
+    const m1 = text.match(/\b(\d{1,2})\s*[:\.]\s*(\d{2})\b/i);
+    if (m1) { let h = parseInt(m1[1], 10); if (h >= 0 && h <= 23) return h; }
+    const m2 = text.match(/\b(\d{1,2})\s*(am|pm)\b/i);
+    if (m2) { let h = parseInt(m2[1], 10); const suf = m2[2].toLowerCase(); if (suf === 'pm' && h < 12) h += 12; if (h >= 0 && h <= 23) return h; }
+    return undefined;
+}
+
+// Extrae dirección desde la 1ª coincidencia de patrón típico
+function extractAddressFromLine(ln) {
+    const t = ln || '';
+    const re = /((?:cra|cr|carrera|cll|calle|av|avenida|transv|transversal|diag|diagonal|mz|manzana|km)\s*[^,\n]*)|((?:#|\d{1,3})\s*[^,\n]*)/i;
+    const m = t.match(re);
+    if (!m) return isLikelyAddress(t) ? t.trim() : '';
+    const start = m.index;
+    let out = t.slice(start).trim();
+    // corta cosas obvias al final (hora "9 am", teléfonos, emails)
+    out = out.replace(/\b\d{1,2}\s*(am|pm)\b/ig, '').trim();
+    out = out.replace(/(?:\+57\s*)?3[\s-]?\d(?:[\s-]?\d){8}\b/g, '').trim();
+    out = out.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig, '').trim();
+    return out;
+}
+
+// Parser principal (no sobreescribe con basura)
+function parseContactAndShipping(text, prevLead = {}) {
+    const out = {};
+    if (!text) return out;
+
+    const rawLines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    // Teléfono CO (10 dígitos iniciando 3), tolera +57
+    const phoneMatch = text.match(/(?:\+57\s*)?(3[\s-]?\d(?:[\s-]?\d){8})\b/);
+    if (phoneMatch) {
+        const digits = onlyDigits(phoneMatch[0]);
+        out.phone = digits.length === 12 && digits.startsWith('57') ? digits.slice(2) : digits;
+    }
+
+    // Email
+    const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    if (emailMatch) out.email = emailMatch[0];
+
+    // Nombre declarado
+    const nameDecl = text.match(/\b(me llamo|mi nombre es)\s+([a-záéíóúñ ]{2,60})/i);
+    if (nameDecl) out.name = capWords(nameDecl[2].trim());
+
+    // Ciudad
+    const city = findCityFreeform(rawLines);
+    if (city) out.city = city;
+
+    // Hora
+    const h = parseHourFreeform(text);
+    if (typeof h === 'number') out.preferredHour = h;
+
+    // Dirección (etiqueta o heurística)
+    let addressIdx = -1;
+    for (let i = 0; i < rawLines.length; i++) {
+        const ln = rawLines[i];
+        const mDir = ln.match(/\b(direcci[oó]n|dir)\s*[:\-]?\s*(.+)$/i);
+        if (mDir) {
+            const cand = extractAddressFromLine(mDir[2]);
+            if (cand) { out.address = cand;
+                addressIdx = i; break; }
+        }
+        if (isLikelyAddress(ln)) {
+            const cand = extractAddressFromLine(ln);
+            if (cand) { out.address = cand;
+                addressIdx = i; break; }
+        }
+    }
+
+    // Barrio
+    for (let i = 0; i < rawLines.length; i++) {
+        const ln = rawLines[i];
+        const mBar = ln.match(/\b(barrio)\s*[:\-]?\s*(.+)$/i);
+        if (mBar) {
+            const cand = mBar[2].trim();
+            if (isLikelyNeighborhood(cand)) { out.neighborhood = capWords(cand); break; }
+        }
+    }
+    if (!out.neighborhood && addressIdx !== -1) {
+        const candidates = [];
+        if (rawLines[addressIdx - 1]) candidates.push(rawLines[addressIdx - 1]);
+        if (rawLines[addressIdx + 1]) candidates.push(rawLines[addressIdx + 1]);
+        for (const c0 of candidates) {
+            const cand = (c0 || '').trim();
+            if (!cand) continue;
+            if (isLikelyNeighborhood(cand)) {
+                const candNorm = norm(cand);
+                const nameNorm = norm(out.name || prevLead.name || '');
+                const cityNorm = norm(out.city || prevLead.city || '');
+                if (candNorm && candNorm !== nameNorm && candNorm !== cityNorm) {
+                    out.neighborhood = capWords(cand);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Nombre por heurística si no vino explícito
+    if (!out.name) {
+        for (const ln of rawLines) {
+            const lnNorm = norm(ln);
+            if (/\d/.test(ln)) continue;
+            if (ln.length > 60) continue;
+            if (isLikelyName(ln)) {
+                const clashCity = norm(out.city || '') === lnNorm;
+                const looksAddr = isLikelyAddress(ln);
+                if (!clashCity && !looksAddr) {
+                    if (out.neighborhood && norm(out.neighborhood) === lnNorm) continue;
+                    out.name = capWords(ln);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Barrio nunca igual a nombre
+    if (out.neighborhood && out.name && norm(out.neighborhood) === norm(out.name)) {
+        delete out.neighborhood;
+    }
+
+    return out;
+}
+
+function clampInput(text) {
+    if (!text) return { text: '', notice: '' };
+    if (UNLIMITED_INPUT) return { text, notice: '' };
+    if (text.length <= MAX_USER_CHARS) return { text, notice: '' };
+    const lines = text.split(/\r?\n/);
+    const kept = [];
+    for (let i = 0; i < lines.length; i++) {
+        const ln = String(lines[i]);
+        if (/^\s*(-|\d+[\).\s])/.test(ln)) kept.push(ln.trim());
+        if (kept.join('\n').length > MAX_USER_CHARS) break;
+    }
+    let final = kept.join('\n');
+    if (!final) final = text.slice(0, MAX_USER_CHARS);
+    const notice = '✂️ Tu mensaje era muy largo; lo resumí para responder ágilmente.\n\n';
+    return { text: final, notice };
+}
+
+function pickRecentHistory(hist) {
+    if (!Array.isArray(hist)) return [];
+    const trimmed = hist.slice(-HISTORY_MAX_TURNS * 2);
+    let out = [],
+        total = 0,
+        BUDGET = 8000;
+    for (let i = trimmed.length - 1; i >= 0; i--) {
+        const m = trimmed[i];
+        const len = m && m.content ? m.content.length : 0;
+        if (total + len > BUDGET) break;
+        out.unshift(m);
+        total += len;
+    }
+    return out;
+}
+
+function formatFallbackSummary() {
+    return 'Perfecto, para programar el despacho solo me faltaría el comprobante de pago (foto).';
+}
+
+// ================== OpenAI (timeout + reintentos) ==================
+async function askOpenAI(messages, opts) {
+    opts = opts || {};
+    const model = opts.model || OPENAI_MODEL;
+    const maxTokens = opts.maxTokens || OPENAI_MAX_TOKENS;
+    const temperature = typeof opts.temperature === 'number' ? opts.temperature : 0.4;
+
+    for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+        try {
+            if (DEBUG) console.log('[AI] intento', attempt, '| msgs=', messages.length);
+            const resp = await withTimeout(
+                openai.chat.completions.create({ model, messages, temperature, max_tokens: maxTokens }),
+                OPENAI_TIMEOUT_MS
+            );
+            const ok = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+            if (ok) {
+                const text = String(resp.choices[0].message.content).trim();
+                if (DEBUG) console.log('[AI] OK len=', text.length);
+                return text;
+            }
+            throw new Error('Respuesta vacía de OpenAI');
+        } catch (e) {
+            console.error('[AI] error intento', attempt, ':', emsg(e));
+            if (attempt === OPENAI_MAX_ATTEMPTS) throw e;
+            await new Promise(r => setTimeout(r, 400 * attempt));
+        }
+    }
+}
+
+// ===== Twilio media from request =====
+function getMediaUrlsFromRequest(req) {
+    const out = [];
+    const num = Number((req && req.body && req.body.NumMedia) ? req.body.NumMedia : 0);
+    for (let i = 0; i < num; i++) {
+        const url = (req && req.body) ? req.body['MediaUrl' + i] : null;
+        const ctype = (req && req.body) ? req.body['MediaContentType' + i] : null;
+        if (url) out.push({ url: String(url), contentType: String(ctype || '') });
+    }
+    return out;
+}
+
+// ===== Archivo resumen pedido =====
+function writeOrderFile({ wa, finalReply, body, lead, media }) {
+    try {
+        const dir = path.join(__dirname, 'orders');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const file = path.join(dir, `${ts}__${(wa || '').replace(/[^+\d]/g, '')}.md`);
+        const lines = [];
+        lines.push(
+            `# Pedido de ${wa || '-'} (${ts})`,
+            ``,
+            `## Resumen generado para el cliente`,
+            finalReply || '(vacío)',
+            ``,
+            '## Mensaje original del cliente',
+            body || '(vacío)',
+            ``,
+            '## Datos de envío (si disponibles)',
+            '- Nombre: ' + ((lead && lead.name) || '-'),
+            '- Celular: ' + ((lead && lead.phone) || '-'),
+            '- Dirección: ' + ((lead && lead.address) || '-'),
+            '- Apto/Casa: ' + ((lead && lead.apartment) || '-'),
+            '- Barrio: ' + ((lead && lead.neighborhood) || '-'),
+            '- Ciudad: ' + ((lead && lead.city) || '-'),
+            '- Referencia (opcional): ' + ((lead && lead.reference) || '-'),
+            '- Horario preferido: ' + ((lead && lead.preferredHour != null) ? (String(lead.preferredHour).padStart(2, '0') + ':00') : '-'),
+            ``,
+            '## Comprobantes (imágenes enviadas)'
+        );
+        if (media && media.length) media.forEach((m, i) => lines.push(`- #${i+1}: ${m.url} (${m.contentType || 'image'})`));
+        else lines.push('(sin adjuntos)');
+        fs.writeFileSync(file, lines.join('\n'), 'utf8');
+        return file;
+    } catch (e) { console.error('[FILE] writeOrderFile:', emsg(e)); return null; }
+}
+
+// === Enviar WhatsApp con (opcional) media — CON DEDUP ===
+const DEDUP_TTL_SECONDS = 120;
+async function sendWhatsAppOnce(to, body, mediaUrls = []) {
+    try {
+        if (!to || !body) return null;
+        const payloadKey = `sent:${to}:${sha1(body)}`;
+        const first = await redis.set(payloadKey, '1', 'NX', 'EX', DEDUP_TTL_SECONDS);
+        if (first === null) {
+            if (DEBUG) console.log('[WA] dedup: ya se envió ese texto recientemente a', to);
+            return null;
+        }
+        const payload = { from: process.env.TWILIO_WHATSAPP_FROM, to, body };
+        if (Array.isArray(mediaUrls) && mediaUrls.length) payload.mediaUrl = mediaUrls.slice(0, 10);
+        const msg = await twilioClient.messages.create(payload);
+        if (DEBUG) console.log('[WA] sent', msg.sid, '->', to);
+        return msg.sid;
+    } catch (e) {
+        console.error('[WA] error]:', emsg(e));
+        return null;
+    }
+}
+
+// ================== Endpoints ==================
+app.post('/twilio-status', express.urlencoded({ extended: false }), (req, res) => {
+    const sid = (req.body && req.body.MessageSid) || '';
+    const status = (req.body && (req.body.MessageStatus || req.body.SmsStatus)) || '';
+    const to = (req.body && req.body.To) || '';
+    const errorCode = (req.body && req.body.ErrorCode) || '';
+    const errorMsg = (req.body && req.body.ErrorMessage) || '';
+    console.log('[STATUS]', sid, '| to=', to, '| status=', status, '| err=', errorCode, errorMsg);
+    res.sendStatus(200);
+});
+
+app.post('/whatsapp', async(req, res) => {
+    const MessagingResponse = twilio.twiml.MessagingResponse;
+    const messageSid = String((req.body && (req.body.MessageSid || req.body.SmsSid)) || '');
+    const from = (req && req.body && req.body.From) ? String(req.body.From) : '';
+    const body = (req && req.body && req.body.Body) ? String(req.body.Body).trim() : '';
+    const media = getMediaUrlsFromRequest(req);
+
+    const fallbackId = messageSid || ('FAKE-' + sha1(from + '|' + body.slice(0, 64)));
+    const seenKey = `seen:msg:${fallbackId}`;
+    const lockKey = `lock:msg:${fallbackId}`;
+
+    try {
+        const firstTime = await redis.set(seenKey, '1', 'NX', 'EX', IDEMP_TTL);
+        if (firstTime === null) {
+            if (!WHATSAPP_ACK) { const tw = new MessagingResponse(); return res.type('text/xml').send(tw.toString()); } else return res.sendStatus(200);
+        }
+
+        const gotLock = await redis.set(lockKey, '1', 'NX', 'EX', LOCK_TTL);
+        if (gotLock === null) {
+            if (!WHATSAPP_ACK) { const tw = new MessagingResponse(); return res.type('text/xml').send(tw.toString()); } else return res.sendStatus(200);
+        }
+
+        if (DEBUG) console.log('IN >>', from, '|', body.slice(0, 140), '... | media:', media.length, '| sid=', fallbackId);
+
+        const result = await processConversation(from, body, media);
+        const out = (result && result.finalReply) ? result.finalReply : '¡Gracias! Ya mismo te confirmo por aquí.';
+
+        if (!WHATSAPP_ACK) {
+            if (TWIML_EMAIL_COPY && EMAIL_ON) {
+                const emailKey = `sent:twimlcopy:${(process.env.ADMIN_EMAIL || '')}:${sha1(from + '|' + out)}`;
+                const firstMail = await redis.set(emailKey, '1', 'NX', 'EX', 300);
+                if (firstMail) await sendEmail({ to: process.env.ADMIN_EMAIL, subject: 'Copia de respuesta (TwiML) - ' + COMPANY_NAME, text: 'Destino: ' + from + '\n\n' + out });
+            }
+            const tw = new MessagingResponse();
+            const msg = tw.message({ statusCallback: process.env.TWILIO_STATUS_CALLBACK || undefined });
+            msg.body(out);
+            return res.type('text/xml').send(tw.toString());
+        } else {
+            await sendWhatsAppOnce(from, out);
+            return res.sendStatus(200);
+        }
+    } catch (err) {
+        console.error('Error /whatsapp:', emsg(err));
+        try {
+            if (!WHATSAPP_ACK) { const twimlErr = new MessagingResponse();
+                twimlErr.message('Ups, hubo un problema. Intenta de nuevo en unos segundos 🙏'); return res.type('text/xml').send(twimlErr.toString()); } else return res.sendStatus(200);
+        } catch (_e) { return res.sendStatus(200); }
+    }
+});
+
+// ================== Core de conversación ==================
+async function processConversation(userWa, rawBody, media = []) {
+    const hist = await getHistory(userWa);
+    let lead = await getLead(userWa);
+
+    // — Capturar datos (soporta mensajes fragmentados)
+    const parsed = parseContactAndShipping(rawBody, lead || {});
+    const gotAny = Object.keys(parsed).length > 0 || (media && media.length);
+    if (gotAny) {
+        lead = await saveLead(userWa, {...(lead || {}), ...parsed, paymentProofs: (lead && Array.isArray(lead.paymentProofs) ? lead.paymentProofs : []).concat(media || []) });
+        // saneo: barrio == nombre → borra
+        if (lead && lead.neighborhood && lead.name && norm(lead.neighborhood) === norm(lead.name)) {
+            lead = await saveLead(userWa, {...lead, neighborhood: undefined });
+        }
+        if (DEBUG) console.log('[LEAD] actualizado:', lead);
+    }
+
+    const trimmed = (rawBody || '').trim();
+
+    // — Si llegó MEDIA (comprobante) ⇒ marcar pago, TG, confirmar despacho
+    if (media && media.length) {
+        const downloaded = [];
+        if (String(process.env.MEDIA_DOWNLOAD || '0') === '1') {
+            const dir = path.join(__dirname, 'orders', 'media');
+            for (const m of media) {
+                const p = await downloadTwilioMedia(m.url, dir);
+                if (p) downloaded.push(p);
+            }
+        }
+        lead = await saveLead(userWa, {...lead, paymentProofs: (lead.paymentProofs || []).concat(media || []), paymentReceivedAt: Date.now() });
+
+        const mediaHashKey = `paid:${userWa}:${sha1(JSON.stringify(media.map(m=>m.url)))}`;
+        const firstProof = await redis.set(mediaHashKey, '1', 'NX', 'EX', 6 * 3600);
+
+        const hourTxt = (lead && lead.preferredHour != null) ? String(lead.preferredHour).padStart(2, '0') + ':00' : null;
+        const tgCaption =
+            `🧾 Comprobante recibido de ${userWa}\n` +
+            (lead && lead.name ? `Nombre: ${lead.name}\n` : '') +
+            (lead && lead.phone ? `Cel: ${lead.phone}\n` : '') +
+            (lead && lead.address ? `Dirección: ${lead.address}\n` : '') +
+            (lead && lead.city ? `Ciudad: ${lead.city}\n` : '') +
+            (hourTxt ? `Horario: ${hourTxt}\n` : '');
+
+        if (firstProof) {
+            if (downloaded.length) await sendTelegramPhotos(downloaded, tgCaption);
+            else {
+                try {
+                    const token = process.env.TELEGRAM_BOT_TOKEN,
+                        chatId = process.env.TELEGRAM_CHAT_ID;
+                    if (token && chatId) await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: tgCaption }, { timeout: 20000 });
+                } catch (e) { console.error('[TG] sendMessage error:', e && e.message ? e.message : e); }
+            }
+        } else if (DEBUG) console.log('[TG] dedup: comprobante ya enviado recientemente');
+
+        const llegada = hourTxt ?
+            `Haremos lo posible para que llegue sobre las *${hourTxt}* (nuestros envíos salen entre 8am y 3pm).` :
+            `Lo despachamos hoy dentro de la ventana de *8am a 3pm*.`;
+
+        const finalReply =
+            `¡Gracias! Recibí el *comprobante de pago* ✅\n` +
+            `Tu orden fue programada para despacho. ${llegada}\n` +
+            `Cualquier novedad te escribo por aquí.`;
+
+        hist.push({ role: 'user', content: rawBody || '[comprobante de pago]' });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+        return { finalReply };
+    }
+
+    // — Estado de datos vs pedido
+    const haveAddress = !!(lead && (lead.address || lead.neighborhood || lead.city));
+    const havePhone = !!(lead && lead.phone);
+    const haveName = !!(lead && lead.name);
+    const paid = !!(lead && lead.paymentReceivedAt);
+
+    const gotAnyShip = !!(parsed.address || parsed.neighborhood || parsed.city || parsed.reference || parsed.preferredHour || parsed.apartment);
+
+    // — Si ya tengo datos de envío suficientes y no está pago → pedir solo COMPROBANTE
+    if (!looksLikeWebCart(trimmed) && !paid && (gotAnyShip || (haveAddress && havePhone))) {
+        const resumenEnvio =
+            (haveName ? `• Nombre: ${lead.name}\n` : '') +
+            (havePhone ? `• Celular: ${lead.phone}\n` : '') +
+            (lead.address ? `• Dirección: ${lead.address}\n` : '') +
+            (lead.apartment ? `• Apto/Casa: ${lead.apartment}\n` : '') +
+            (lead.neighborhood ? `• Barrio: ${lead.neighborhood}\n` : '') +
+            (lead.city ? `• Ciudad: ${lead.city}\n` : '') +
+            (lead.reference ? `• Referencia: ${lead.reference}\n` : '') +
+            (lead.preferredHour != null ? `• Horario preferido: ${String(lead.preferredHour).padStart(2,'0')}:00\n` : '');
+
+        const finalReply =
+            (resumenEnvio ? `¡Perfecto! Tomé estos *datos de envío*:\n${resumenEnvio}\n` : '') +
+            `Para programar el despacho, por favor envíame la *foto del comprobante de pago*.\n\n` +
+            `Métodos:\n- *Nequi:* ${process.env.PAY_NEQUI || 'CHANGE_ME'}\n- *Davivienda:* ${process.env.PAY_DAVIVIENDA || 'CHANGE_ME'}\n- *BRE-B:* ${process.env.PAY_BREB || process.env.PAY_PSE || 'CHANGE_ME'}`;
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+        return { finalReply };
+    }
+
+    // ===== Carrito detectado → resumen + métodos + PEDIR DATOS de despacho =====
+    const isCart = looksLikeWebCart(trimmed);
+    if (isCart) {
+        const parsedCart = parseWebCart(trimmed);
+        let total = 0;
+        const lines = [];
+        parsedCart.items.forEach((it, idx) => {
+            const line = `${idx+1}. *${it.name}* · Cantidad: ${it.qty} · ${formatCOP(it.unit)} = ${formatCOP(it.subtotal)}`;
+            lines.push(line);
+            total += (it.subtotal || (it.qty * it.unit));
+        });
+        if (parsedCart.totalFromText != null && Math.abs(parsedCart.totalFromText - total) < 2000) {
+            total = parsedCart.totalFromText;
+        }
+
+        // Envío según ciudad (si infiere Antioquia; si no, deja nota)
+        const cityKey = inferCity([trimmed, (lead && lead.city) || ''].join(' '));
+        const shipInfo = shippingForCity(cityKey);
+        let envioLinea = '';
+        if (shipInfo.allowed === true && shipInfo.price != null) {
+            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
+        } else if (shipInfo.allowed === false) {
+            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${shipInfo.note}`;
+        }
+
+        const header =
+            `Gracias por tu pedido, aquí tienes el resumen:\n\n${lines.join('\n')}` +
+            `${envioLinea}\n\n*Total a pagar:* ${formatCOP(total)}${shipInfo.price ? ' + envío' : ''}`;
+
+        const pagos =
+            `\nPor favor, indícame tu método de pago y (cuando lo hagas) envíame el comprobante (foto):\n` +
+            `- *Nequi:* ${process.env.PAY_NEQUI || 'CHANGE_ME'}\n` +
+            `- *Davivienda:* ${process.env.PAY_DAVIVIENDA || 'CHANGE_ME'}\n` +
+            `- *BRE-B:* ${process.env.PAY_BREB || process.env.PAY_PSE || 'CHANGE_ME'}`;
+
+        const pedirDatos =
+            `\n\nPara el despacho, confírmame por favor:\n` +
+            `• *Nombre completo*\n` +
+            `• *Celular*\n` +
+            `• *Dirección + Apto/Casa*\n` +
+            `• *Barrio*\n` +
+            `• *Ciudad*\n` +
+            `• *Referencia de vivienda (opcional)*\n` +
+            `• *Horario preferido (entre 8am y 3pm)*\n`;
+
+        const finalReply = header + pagos + pedirDatos;
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+
+        // Notificar admin (opcionalmente con media si el carrito trae fotos —normalmente no)
+        try {
+            const adminTo = process.env.ADMIN_WA;
+            if (adminTo && adminTo !== userWa) await sendWhatsAppOnce(adminTo, `🧾 *Nuevo pedido (carrito)*\nDe: ${userWa}\n\n${finalReply}`);
+        } catch (e) { console.error('[WA->ADMIN] notify error]:', emsg(e)); }
+
+        return { finalReply };
+    }
+
+    // ===== IA para casos libres =====
+    const clamp = clampInput(rawBody);
+    const recentHist = pickRecentHistory(hist);
+    const messages = [{
+            role: 'system',
+            content: `Si el usuario describe necesidad pero no manda carrito: haz 1–2 preguntas cortas y sugiere 1–3 productos del catálogo si aplica.` +
+                ` Mantén foco en cerrar: si faltan *datos de envío*, pídelos; si ya hay datos, pide *solo comprobante*.`
+        },
+        { role: 'system', content: systemPrompt },
+        ...recentHist,
+        { role: 'user', content: clamp.text }
+    ];
+
+    let reply;
+    try {
+        reply = await askOpenAI(messages, { model: OPENAI_MODEL, maxTokens: OPENAI_MAX_TOKENS, temperature: 0.4 });
+    } catch (_e) {
+        if (DEBUG) console.log('[AI] usando fallback local');
+        reply = formatFallbackSummary(rawBody);
+    }
+
+    hist.push({ role: 'user', content: rawBody });
+    hist.push({ role: 'assistant', content: (clamp.notice || '') + reply });
+    await setHistory(userWa, hist);
+
+    const finalReply = (clamp.notice || '') + reply;
+
+    // Archivo + correo (opcional)
+    try {
+        const filePath = writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media });
+        const attachments = [];
+        if (filePath) attachments.push({ filename: path.basename(filePath), path: filePath });
+        if (attachments.length) await sendEmail({ to: process.env.ADMIN_EMAIL, subject: '🧾 Conversación WhatsApp', text: finalReply, attachments });
+    } catch (e) { console.error('[MAIL] notify order]:', emsg(e)); }
+
+    // Notifica admin texto
+    try {
+        const adminTo = process.env.ADMIN_WA;
+        if (adminTo && adminTo !== userWa) await sendWhatsAppOnce(adminTo, `🧾 *Nuevo mensaje*\nDe: ${userWa}\n\n${finalReply}`);
+    } catch (e) { console.error('[WA->ADMIN] notify error]:', emsg(e)); }
+
+    return { finalReply };
+}
+
+// ================== Health ==================
+app.get('/health', async(req, res) => {
+    try {
+        const ping = await redis.ping();
+        return res.json({ ok: true, time: new Date().toISOString(), redis: ping === 'PONG', ackMode: WHATSAPP_ACK ? 'ACK+REST' : 'TwiML', model: process.env.OPENAI_MODEL });
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: emsg(e) });
+    }
+});
+
+// ================== Inicio ==================
+app.listen(PORT, () => {
+    console.log('Server on http://localhost:' + PORT, '| TZ=', TIMEZONE, '| ACK=', WHATSAPP_ACK ? 'ON' : 'OFF', '| UnlimitedInput=', UNLIMITED_INPUT ? 'YES' : 'NO');
+});
+
+// ================== Salida limpia ==================
+process.on('SIGINT', async() => { try { await redis.quit(); } catch (_e) {}
+    console.log('[EXIT] SIGINT');
+    process.exit(0); });
+process.on('SIGTERM', async() => { try { await redis.quit(); } catch (_e) {}
+    console.log('[EXIT] SIGTERM');
+    process.exit(0); });
+
+// === Media download helper ===
+async function downloadTwilioMedia(url, outDir) {
+    try {
+        if (!url) return null;
+        if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+        const fileName = Date.now() + '-' + path.basename(url.split('?')[0]);
+        const outPath = path.join(outDir, fileName);
+        const resp = await axios.get(url, {
+            responseType: 'stream',
+            auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+            timeout: 20000,
+        });
+        await new Promise((resolve, reject) => {
+            const ws = fs.createWriteStream(outPath);
+            resp.data.pipe(ws);
+            ws.on('finish', resolve);
+            ws.on('error', reject);
+        });
+        return outPath;
+    } catch (e) {
+        console.error('[MEDIA] download error:', e && e.message ? e.message : e);
+        return null;
+    }
+}
+
+// ================== Redis helpers ==================
+const keyHistory = (waId) => `chat:wa:${waId}:history`;
+const keyLead = (waId) => `lead:${waId}`;
+
+async function getHistory(waId) {
+    try {
+        const raw = await redis.get(keyHistory(waId));
+        return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] getHistory]:', emsg(e));
+        return [];
+    }
+}
+async function setHistory(waId, history) {
+    try {
+        const trimmed = history.slice(-40);
+        await redis.set(keyHistory(waId), JSON.stringify(trimmed), 'EX', TTL_SECONDS);
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] setHistory:', emsg(e));
+    }
+}
+async function getLead(waId) {
+    try {
+        const raw = await redis.get(keyLead(waId));
+        return raw ? JSON.parse(raw) : {};
+    } catch (_e) { return {}; }
+}
+async function saveLead(waId, data) {
+    const prev = await getLead(waId);
+    const current = Object.assign({}, prev, data);
+    await redis.set(keyLead(waId), JSON.stringify(current), 'EX', 90 * 24 * 3600);
+    return current;
+}

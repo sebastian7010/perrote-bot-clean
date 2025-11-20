@@ -1,0 +1,574 @@
+sebastian @sebastian - HP - Laptop - 15 - dy2xxx: ~/wa-twilio-openai$ node server.js [CATALOG] items: 877
+Server on http: //localhost:3008 | TZ= America/Bogota | ACK= OFF | UnlimitedInput= YES | ClearOnCart= YES
+    [META][GET] { mode: 'subscribe', token: 'sebastian123', challenge: '1225090797' }
+    [META] Webhook verification OK✅[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgUM0E0RDVBNTJBNzYxM0JFQzM0ODkA",
+                        "timestamp": "1763034659",
+                        "text": {
+                            "body": "Hola"
+                        },
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | Hola... | media: 0[META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOUZGOEZCRUYyQkQ5MEFDNzFFAA==" }] }
+OUT META << len = 40[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOUZGOEZCRUYyQkQ5MEFDNzFFAA==",
+                        "status": "sent",
+                        "timestamp": "1763115504",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOUZGOEZCRUYyQkQ5MEFDNzFFAA==",
+                        "status": "delivered",
+                        "timestamp": "1763115504",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMDM1MDI4RTA2NkM0NUMxOUNFNQA=",
+                        "timestamp": "1763115507",
+                        "text": {
+                            "body": "Hola, estoy interesado en comprar los siguientes productos: *Chunky Adulto Pollo x 4 Kilos* Cantidad: 5 Precio unitario: $35.000 Subtotal: $175.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (9).webp *Chunky Adulto Pollo x 4 Kilos* Cantidad: 1 Precio unitario: $35.000 Subtotal: $35.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (3).webp *Agility Gold Primera Fase x 1.5 kilos* Cantidad: 1 Precio unitario: $40.400 Subtotal: $40.400 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-15-kilos-.webp *Agility Gold Primera Fase x 500 gramos* Cantidad: 3 Precio unitario: $16.500 Subtotal: $49.500 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-500-gramos-.webp *Agility Gold Pequeños Adultos x 7 kilos* Cantidad: 3 Precio unitario: $155.000 Subtotal: $465.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-pequenos-adultos-x-7-kilos (2).webp *Apoquel Perros 5,4 Mg 20 Tabletas* Cantidad: 4 Precio unitario: $160.800 Subtotal: $643.200 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/apoquel-perros-54-mg-20-tabletas (3).webp Total a pagar: $1.408.1004"
+                        },
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | Hola, estoy interesado en comprar los siguientes productos: * Chunky Adulto Pollo x 4 Kilos * Cantidad: 5 Precio unitario: $35 .000 Subtotal: $... | media: 0[META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSNjlEQUREMTM0NjY0MDVBQjhDAA==" }] }
+OUT META << len = 40[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSNjlEQUREMTM0NjY0MDVBQjhDAA==",
+                        "status": "sent",
+                        "timestamp": "1763115509",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSNjlEQUREMTM0NjY0MDVBQjhDAA==",
+                        "status": "delivered",
+                        "timestamp": "1763115509",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMEEyNDA4QzkxRDVCRjgxOEFFOQA=",
+                        "timestamp": "1763115514",
+                        "text": {
+                            "body": "que"
+                        },
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | que... | media: 0[META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSRTRCNkJDNkE2NjA5MzMzRUJCAA==" }] }
+OUT META << len = 40[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSRTRCNkJDNkE2NjA5MzMzRUJCAA==",
+                        "status": "sent",
+                        "timestamp": "1763115515",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSRTRCNkJDNkE2NjA5MzMzRUJCAA==",
+                        "status": "delivered",
+                        "timestamp": "1763115515",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    } ^
+    A ^ C[EXIT] SIGINT
+sebastian @sebastian - HP - Laptop - 15 - dy2xxx: ~/wa-twilio-openai$ ^C
+sebastian @sebastian - HP - Laptop - 15 - dy2xxx: ~/wa-twilio-openai$ node server.js [CATALOG] items: 877
+Server on http: //localhost:3008 | TZ= America/Bogota | ACK= OFF | UnlimitedInput= YES | ClearOnCart= YES
+    [META][GET] { mode: 'subscribe', token: 'sebastian123', challenge: '1370510855' }
+    [META] Webhook verification OK✅[META][GET] { mode: 'subscribe', token: 'sebastian123', challenge: '2117917635' }
+    [META] Webhook verification OK✅[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMDNGMTg3NzZEQ0U4RDMyNDhCRAA=",
+                        "timestamp": "1763119197",
+                        "text": {
+                            "body": "Hola, estoy interesado en comprar los siguientes productos: *Chunky Adulto Pollo x 4 Kilos* Cantidad: 5 Precio unitario: $35.000 Subtotal: $175.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (9).webp *Chunky Adulto Pollo x 4 Kilos* Cantidad: 1 Precio unitario: $35.000 Subtotal: $35.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (3).webp *Agility Gold Primera Fase x 1.5 kilos* Cantidad: 1 Precio unitario: $40.400 Subtotal: $40.400 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-15-kilos-.webp *Agility Gold Primera Fase x 500 gramos* Cantidad: 3 Precio unitario: $16.500 Subtotal: $49.500 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-500-gramos-.webp *Agility Gold Pequeños Adultos x 7 kilos* Cantidad: 3 Precio unitario: $155.000 Subtotal: $465.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-pequenos-adultos-x-7-kilos (2).webp *Apoquel Perros 5,4 Mg 20 Tabletas* Cantidad: 4 Precio unitario: $160.800 Subtotal: $643.200 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/apoquel-perros-54-mg-20-tabletas (3).webp Total a pagar: $1.408.1004"
+                        },
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | Hola, estoy interesado en comprar los siguientes productos: * Chunky Adulto Pollo x 4 Kilos * Cantidad: 5 Precio unitario: $35 .000 Subtotal: $... | media: 0[WA] error]: Authenticate
+    [META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSMEQxMUEzMDcxRjUzQUYxMzgxAA==" }] }
+OUT META << len = 804[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSMEQxMUEzMDcxRjUzQUYxMzgxAA==",
+                        "status": "sent",
+                        "timestamp": "1763119317",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSMEQxMUEzMDcxRjUzQUYxMzgxAA==",
+                        "status": "delivered",
+                        "timestamp": "1763119318",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMDAzQzg0MzE1MDQyMTNGRTI2MAA=",
+                        "timestamp": "1763119336",
+                        "text": {
+                            "body": "sebastian solorzano carvajal 3108853158 cra 55 ea#17-43 rionegro antioquia"
+                        },
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | sebastian solorzano carvajal 3108853158 cra 55 ea #17-43 rionegro antioquia ... | media: 0
+[LEAD] actualizado: {
+  phone: '3108853158',
+  city: 'Rionegro',
+  address: 'cra 55 ea # 17 - 43 rionegro antioquia ',
+paymentProofs: [
+        { url: '712148561929674', contentType: 'image/jpeg' },
+        { url: '712148561929674', contentType: 'image/jpeg' },
+        { url: '1368662251577796', contentType: 'image/jpeg' },
+        { url: '1368662251577796', contentType: 'image/jpeg' },
+        { url: '1499646251302988', contentType: 'image/jpeg' },
+        { url: '25184763397856626', contentType: 'image/jpeg' }
+    ],
+    name: '[imagen Recibida]',
+    paymentReceivedAt: 1763111451501
+}
+[AI] intento 1 | msgs = 19[AI] OK len = 317[WA] error]: Authenticate
+    [META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOEQ5OEJGMEMwQzdGQzdFMjRDAA==" }] }
+OUT META << len = 317[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOEQ5OEJGMEMwQzdGQzdFMjRDAA==",
+                        "status": "sent",
+                        "timestamp": "1763119341",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSOEQ5OEJGMEMwQzdGQzdFMjRDAA==",
+                        "status": "delivered",
+                        "timestamp": "1763119341",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "contacts": [{
+                        "profile": {
+                            "name": "Sebastian"
+                        },
+                        "wa_id": "573108853158"
+                    }],
+                    "messages": [{
+                        "from": "573108853158",
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMDJBMzNCMzU4RDMzNzY4RTUxRAA=",
+                        "timestamp": "1763119355",
+                        "type": "image",
+                        "image": {
+                            "mime_type": "image/jpeg",
+                            "sha256": "tmFWA6j+IHD3xQQC6cNcZC+i6agAGk/HrTZIRv//m+4=",
+                            "id": "1511471143398283"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+IN META >> meta: 573108853158 | [imagen recibida]... | media: 1[LEAD] actualizado: {
+        phone: '3108853158',
+        city: 'Rionegro',
+        address: 'cra 55 ea # 17-43 rionegro antioquia',
+        paymentProofs: [
+            { url: '712148561929674', contentType: 'image/jpeg' },
+            { url: '712148561929674', contentType: 'image/jpeg' },
+            { url: '1368662251577796', contentType: 'image/jpeg' },
+            { url: '1368662251577796', contentType: 'image/jpeg' },
+            { url: '1499646251302988', contentType: 'image/jpeg' },
+            { url: '25184763397856626', contentType: 'image/jpeg' },
+            { url: '1511471143398283', contentType: 'image/jpeg' }
+        ],
+        name: '[imagen Recibida]',
+        paymentReceivedAt: 1763111451501
+    }
+    [TG] aviso: no hay rutas de imagen para enviar, solo texto[TG] sendText error: Request failed with status code 400[AI] intento 1 | msgs = 18[AI] OK len = 206[WA] error]: Authenticate
+    [META][SEND] OK { "messaging_product": "whatsapp", "contacts": [{ "input": "573108853158", "wa_id": "573108853158" }], "messages": [{ "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSODc4MjE1MEJCOTM2Nzg0N0JGAA==" }] }
+OUT META << len = 206[META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSODc4MjE1MEJCOTM2Nzg0N0JGAA==",
+                        "status": "sent",
+                        "timestamp": "1763119361",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+    [META][POST] body = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "795313316835997",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "15551462522",
+                        "phone_number_id": "901264499731203"
+                    },
+                    "statuses": [{
+                        "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAERgSODc4MjE1MEJCOTM2Nzg0N0JGAA==",
+                        "status": "delivered",
+                        "timestamp": "1763119362",
+                        "recipient_id": "573108853158",
+                        "pricing": {
+                            "billable": false,
+                            "pricing_model": "PMP",
+                            "category": "service",
+                            "type": "free_customer_service"
+                        }
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }

@@ -1,0 +1,51 @@
+sebastian@sebastian-HP-Laptop-15-dy2xxx:~/wa-twilio-openai$ node server.js
+[CATALOG] items: 877
+Server on http://localhost:3008 | TZ= America/Bogota | ACK= OFF | UnlimitedInput= YES | ClearOnCart= YES
+[META][GET] { mode: 'subscribe', token: 'sebastian123', challenge: '1073932943' }
+[META] Webhook verification OK ✅
+[META][GET] { mode: 'subscribe', token: 'sebastian123', challenge: '1927227354' }
+[META] Webhook verification OK ✅
+[META][POST] body = {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "795313316835997",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15551462522",
+              "phone_number_id": "901264499731203"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Sebastian"
+                },
+                "wa_id": "573108853158"
+              }
+            ],
+            "messages": [
+              {
+                "from": "573108853158",
+                "id": "wamid.HBgMNTczMTA4ODUzMTU4FQIAEhgWM0VCMDUxMDQ5QkEwNzMyN0IzMzdFRAA=",
+                "timestamp": "1763121310",
+                "text": {
+                  "body": "Hola, estoy interesado en comprar los siguientes productos: *Chunky Adulto Pollo x 4 Kilos* Cantidad: 5 Precio unitario: $35.000 Subtotal: $175.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (9).webp *Chunky Adulto Pollo x 4 Kilos* Cantidad: 1 Precio unitario: $35.000 Subtotal: $35.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/chunky-adulto-pollo-x-4-kilos (3).webp *Agility Gold Primera Fase x 1.5 kilos* Cantidad: 1 Precio unitario: $40.400 Subtotal: $40.400 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-15-kilos-.webp *Agility Gold Primera Fase x 500 gramos* Cantidad: 3 Precio unitario: $16.500 Subtotal: $49.500 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-primera-fase-x-500-gramos-.webp *Agility Gold Pequeños Adultos x 7 kilos* Cantidad: 3 Precio unitario: $155.000 Subtotal: $465.000 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/agility-gold-pequenos-adultos-x-7-kilos (2).webp *Apoquel Perros 5,4 Mg 20 Tabletas* Cantidad: 4 Precio unitario: $160.800 Subtotal: $643.200 Imagen: https://perrote-gatote-images.s3.us-east-2.amazonaws.com/imagenes-webp/apoquel-perros-54-mg-20-tabletas (3).webp Total a pagar: $1.408.1004"
+                },
+                "type": "text"
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+IN META >> meta:573108853158 | Hola, estoy interesado en comprar los siguientes productos: *Chunky Adulto Pollo x 4 Kilos* Cantidad: 5 Precio unitario: $35.000 Subtotal: $ ... | media: 0
+[WA] error]: Authenticate
+[META][SEND] error: Request failed with status code 400
+OUT META << len = 804
+^C[EXIT] SIGINT
