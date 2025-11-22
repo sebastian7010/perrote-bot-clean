@@ -368,6 +368,38 @@ function looksLikeWebCart(text) {
     return (a && b && c) || d;
 }
 
+
+
+
+// ================== Parseo de "Hola, quiero comprar X por $Y" ==================
+function parseSingleLineCart(text) {
+    if (!text) return null;
+
+    // Ejemplos que queremos detectar:
+    // "Hola, quiero comprar Arena para gato Fresh Step Multi Cat con Febreze 25Lbs por $106,200."
+    // "Quiero comprar Chunky Adulto Pollo x 2 Kilos por 18.000"
+    const re = /quiero\s+comprar\s+(.+?)\s+por\s+([\$\d\.\,]+)/i;
+    const m = text.match(re);
+    if (!m) return null;
+
+    let name = m[1].trim();
+    const priceStr = m[2];
+
+    const unit = parseCOPnum(priceStr);
+    if (!Number.isFinite(unit)) return null;
+
+    // Cantidad por defecto = 1
+    return {
+        name,
+        qty: 1,
+        unit,
+        subtotal: unit,
+    };
+}
+
+
+
+
 // ================== Envíos (reglas locales) ==================
 function normalize(t) { return (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
 
@@ -965,11 +997,14 @@ async function processConversation(userWa, rawBody, media = []) {
     let lead = await getLead(userWa);
     const trimmed = (rawBody || '').trim();
 
+    // Comando de reset
     if (/^\s*(reset|reiniciar|nuevo pedido)\s*$/i.test(trimmed)) {
         await saveLead(userWa, {});
         await setHistory(userWa, []);
         return { finalReply: '¡Listo! Empecemos de cero. Envíame tu carrito o los productos, y luego los datos de envío.' };
     }
+
+    // Parseo de datos de envío + media
     const parsed = parseContactAndShipping(rawBody, lead || {});
     const hasMedia = media && media.length > 0;
     const gotAny = Object.keys(parsed).length > 0 || hasMedia;
@@ -983,14 +1018,12 @@ async function processConversation(userWa, rawBody, media = []) {
             paymentProofs: prevProofs.concat(media || [])
         };
 
-        // ⚠️ si llegaron nuevas imágenes, marcamos como pago reciente
         if (hasMedia) {
             patch.paymentReceivedAt = Date.now();
         }
 
         lead = await saveLead(userWa, patch);
 
-        // pequeña limpieza: si por error barrio == nombre, lo quitamos
         if (lead && lead.neighborhood && lead.name && norm(lead.neighborhood) === norm(lead.name)) {
             lead = await saveLead(userWa, {...lead, neighborhood: undefined });
         }
@@ -998,8 +1031,7 @@ async function processConversation(userWa, rawBody, media = []) {
         if (DEBUG) console.log('[LEAD] actualizado:', lead);
     }
 
-
-    // Si llegan comprobantes (media) → avisamos por Telegram con un resumen
+    // Si llegan comprobantes → avisamos por Telegram
     if (media && media.length) {
         try {
             const lineas = [];
@@ -1024,8 +1056,6 @@ async function processConversation(userWa, rawBody, media = []) {
             lineas.push('----------------------------');
 
             const textResumen = lineas.join('\n');
-
-            // Por ahora enviamos solo TEXTO a Telegram
             await sendTelegramText(textResumen);
         } catch (e) {
             console.error('[TG] error al enviar comprobante a Telegram:', emsg(e));
@@ -1035,6 +1065,7 @@ async function processConversation(userWa, rawBody, media = []) {
     const paid = isPaidRecent(lead);
     let envioCompleto = isShippingComplete(lead);
 
+    // === 1) Carrito grande (copiado desde la web) ===
     const isCart = looksLikeWebCart(trimmed);
     if (isCart) {
         if (CLEAR_ON_NEW_CART) {
@@ -1057,17 +1088,10 @@ async function processConversation(userWa, rawBody, media = []) {
 
         const cityKey = inferCity([trimmed, (lead && lead.city) || ''].join(' '));
         const shipInfo = shippingForCity(cityKey);
-        let envioLinea = '';
-        if (shipInfo.allowed === true && shipInfo.price != null) {
-            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
-        } else if (shipInfo.allowed === false) {
-            envioLinea = `\n${(lines.length + 1)}. *Envío*: ${shipInfo.note}`;
-        }
 
         let totalFinal = total;
-        let lineaEnvio = "";
+        let lineaEnvio = '';
 
-        // Si hay envío permitido y con precio → súmalo
         if (shipInfo.allowed === true && shipInfo.price != null) {
             totalFinal += shipInfo.price;
             lineaEnvio = `\n${(lines.length + 1)}. *Envío*: ${formatCOP(shipInfo.price)} (${shipInfo.note})`;
@@ -1079,12 +1103,10 @@ async function processConversation(userWa, rawBody, media = []) {
             `Gracias por tu pedido, aquí tienes el resumen:\n\n${lines.join('\n')}` +
             `${lineaEnvio}\n\n*Total a pagar:* ${formatCOP(totalFinal)}`;
 
-
         const pagos =
             `\nPuedes pagar por... envíame el comprobante (foto):\n` +
             `- *Nequi:* 0090610545\n` +
             `- *BRE-B:* @DAVIPERROTGATOTE`;
-
 
         let finalReply = header + '\n' + pagos + '\n';
 
@@ -1104,7 +1126,6 @@ async function processConversation(userWa, rawBody, media = []) {
         try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
 
         try {
-            // Antes se notificaba por WhatsApp (Twilio), ahora lo mandamos a Telegram
             await sendTelegramText(`🧾 *Nuevo pedido (carrito)*\nDe: ${userWa}\n\n${finalReply}`);
         } catch (e) {
             console.error('[ADMIN] notify (cart):', emsg(e));
@@ -1113,8 +1134,52 @@ async function processConversation(userWa, rawBody, media = []) {
         return { finalReply };
     }
 
-    // 5) Sin carrito: lógica determinista ANTES de IA
-    // 5) Sin carrito: lógica determinista ANTES de IA
+    // === 2) Carrito de UNA sola línea: "quiero comprar X por $Y" ===
+    const singleItem = parseSingleLineCart(trimmed);
+    if (singleItem) {
+        const line = `1. *${singleItem.name}* · Cantidad: ${singleItem.qty} · ${formatCOP(singleItem.unit)} = ${formatCOP(singleItem.subtotal)}`;
+
+        let totalFinal = singleItem.subtotal;
+
+        let header =
+            `Gracias por tu pedido, aquí tienes el resumen:\n\n` +
+            `${line}\n\n` +
+            `*Total a pagar:* ${formatCOP(totalFinal)}`;
+
+        const pagos =
+            `\nPuedes pagar por... envíame el comprobante (foto):\n` +
+            `- *Nequi:* 0090610545\n` +
+            `- *BRE-B:* @DAVIPERROTGATOTE`;
+
+        let finalReply = header + '\n' + pagos + '\n';
+
+        if (!envioCompleto) {
+            const faltan = missingShippingFields(lead).map(f => `• *${f}*`).join('\n');
+            finalReply +=
+                `\nPara el despacho, confírmame por favor:\n${faltan}\n\n` +
+                `*Por favor responde todo en un solo mensaje.*\n`;
+        } else {
+            finalReply +=
+                `\n¡Perfecto! Ya tengo tus *datos de envío*.\n` +
+                `Para programar el despacho, por favor envíame la *foto del comprobante de pago*.\n`;
+        }
+
+        hist.push({ role: 'user', content: rawBody });
+        hist.push({ role: 'assistant', content: finalReply });
+        await setHistory(userWa, hist);
+
+        try { writeOrderFile({ wa: userWa, finalReply, body: rawBody, lead, media }); } catch {}
+
+        try {
+            await sendTelegramText(`🧾 *Nuevo pedido (mensaje corto)*\nDe: ${userWa}\n\n${finalReply}`);
+        } catch (e) {
+            console.error('[ADMIN] notify (single):', emsg(e));
+        }
+
+        return { finalReply };
+    }
+
+    // === 3) Sin carrito pero con datos de envío completos y sin pago ===
     if (!paid && envioCompleto) {
         const resumen =
             (lead.name ? `• Nombre: ${lead.name}\n` : '') +
@@ -1140,7 +1205,7 @@ async function processConversation(userWa, rawBody, media = []) {
         return { finalReply };
     }
 
-
+    // === 4) Falta info de envío ===
     if (!envioCompleto) {
         const faltan = missingShippingFields(lead).map(f => `• *${f}*`).join('\n');
         const finalReply =
@@ -1154,7 +1219,7 @@ async function processConversation(userWa, rawBody, media = []) {
         return { finalReply };
     }
 
-    // 6) IA (casos libres). Si falla, fallback contextual.
+    // === 5) IA (casos libres) ===
     const clamp = clampInput(rawBody);
     const recentHist = pickRecentHistory(hist);
     const messages = [{
@@ -1196,6 +1261,8 @@ async function processConversation(userWa, rawBody, media = []) {
 
     return { finalReply };
 }
+
+
 
 // ================== Health ==================
 app.get('/health', async(req, res) => {
