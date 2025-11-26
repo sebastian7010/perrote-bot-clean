@@ -33,6 +33,10 @@ const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 const HISTORY_TTL_SECONDS = (parseInt(process.env.MEMORY_TTL_DAYS, 10) || 30) * 24 * 60 * 60;
 const HISTORY_MAX_MESSAGES = 24;
 
+// Claves redis
+const keyHistory = (waId) => `chat:wa:${waId}:history`;
+const keyLastProduct = (waId) => `chat:wa:${waId}:last-product`;
+
 // UltraMsg
 const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID || '';
 const ULTRA_TOKEN = process.env.ULTRA_TOKEN || '';
@@ -50,27 +54,7 @@ if (DEBUG) {
 // ================== OpenAI client ==================
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ================== Catálogo (products.json) ==================
-const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
-let CATALOG = [];
-
-function loadCatalog() {
-    try {
-        if (fs.existsSync(CATALOG_PATH)) {
-            const raw = fs.readFileSync(CATALOG_PATH, 'utf8');
-            CATALOG = JSON.parse(raw);
-            if (DEBUG) console.log('[CATALOG] cargados', CATALOG.length, 'productos');
-        } else {
-            console.warn('[CATALOG] No se encontró data/products.json, el bot no tendrá info de productos.');
-            CATALOG = [];
-        }
-    } catch (e) {
-        console.error('[CATALOG] error al cargar products.json:', e && e.message ? e.message : e);
-        CATALOG = [];
-    }
-}
-loadCatalog();
-
+// ================== Helpers generales ==================
 function normalize(str) {
     return (str || '')
         .toString()
@@ -94,7 +78,64 @@ function formatCOP(n) {
     }
 }
 
-// Encuentra productos relevantes según el texto del usuario
+// Levenshtein para tolerar mala ortografía
+function levenshtein(a, b) {
+    a = a || '';
+    b = b || '';
+    const m = a.length;
+    const n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    const dp = new Array(n + 1);
+    for (let j = 0; j <= n; j++) dp[j] = j;
+    for (let i = 1; i <= m; i++) {
+        let prev = dp[0];
+        dp[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const temp = dp[j];
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            dp[j] = Math.min(
+                dp[j] + 1,
+                dp[j - 1] + 1,
+                prev + cost
+            );
+            prev = temp;
+        }
+    }
+    return dp[n];
+}
+
+function similarity(a, b) {
+    a = a || '';
+    b = b || '';
+    const maxLen = Math.max(a.length, b.length);
+    if (!maxLen) return 0;
+    const dist = levenshtein(a, b);
+    return 1 - dist / maxLen;
+}
+
+// ================== Catálogo (products.json) ==================
+const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
+let CATALOG = [];
+
+function loadCatalog() {
+    try {
+        if (fs.existsSync(CATALOG_PATH)) {
+            const raw = fs.readFileSync(CATALOG_PATH, 'utf8');
+            CATALOG = JSON.parse(raw);
+            if (DEBUG) console.log('[CATALOG] cargados', CATALOG.length, 'productos');
+        } else {
+            console.warn('[CATALOG] No se encontró data/products.json, el bot no tendrá info de productos.');
+            CATALOG = [];
+        }
+    } catch (e) {
+        console.error('[CATALOG] error al cargar products.json:', e && e.message ? e.message : e);
+        CATALOG = [];
+    }
+}
+loadCatalog();
+
+// Buscar productos relevantes usando coincidencia + algo de tolerancia a errores
 function findRelevantProducts(query, maxResults = 5) {
     if (!query || !CATALOG.length) return [];
     const qNorm = normalize(query);
@@ -112,7 +153,24 @@ function findRelevantProducts(query, maxResults = 5) {
 
         let score = 0;
         for (const t of tokens) {
-            if (haystack.includes(t)) score++;
+            if (haystack.includes(t)) score += 2; // coincidencia directa suma más
+        }
+
+        // Si no hubo coincidencias directas, probamos similitud difusa con el nombre
+        if (score === 0 && tokens.length) {
+            const nameNorm = normalize(name);
+            const nameWords = nameNorm.split(/\s+/).filter(Boolean);
+            let bestSim = 0;
+            for (const t of tokens) {
+                for (const w of nameWords) {
+                    const sim = similarity(t, w);
+                    if (sim > bestSim) bestSim = sim;
+                }
+            }
+            // Solo aceptamos productos que se parezcan bastante (ej. dogurmet vs dogurmet)
+            if (bestSim >= 0.7) {
+                score = 1 + bestSim; // algo positivo para entrar
+            }
         }
 
         if (score > 0) {
@@ -121,7 +179,6 @@ function findRelevantProducts(query, maxResults = 5) {
     }
 
     if (!scored.length) return [];
-
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, maxResults).map(x => x.prod);
 }
@@ -133,9 +190,11 @@ function buildProductContext(userText) {
 
     const lines = [];
     lines.push(
-        'Contexto de productos relevantes del catálogo de Perrote y Gatote. ' +
-        'Úsalo solo como referencia interna: no es necesario mostrar toda esta lista al cliente, ' +
-        'solo mencionar los productos que realmente apliquen.'
+        'LISTA DE PRODUCTOS DEL CATÁLOGO (NO INVENTES OTROS):\n' +
+        'Solo puedes hablar de estos productos como disponibles en la tienda. ' +
+        'Si el usuario menciona algo que NO coincide claramente con estos productos, ' +
+        'debes decirle que no lo tienes o que no aparece en tu catálogo y ofrecerle alternativas de esta misma lista. ' +
+        'Nunca inventes nombres de productos ni precios.'
     );
     lines.push('');
 
@@ -156,6 +215,85 @@ function buildProductContext(userText) {
     return lines.join('\n');
 }
 
+// ================== Tarifas de domicilio (VOPU) ==================
+const SHIPPING_ZONES = [{
+        key: 'rionegro',
+        label: 'Rionegro urbano (recorrido mínimo)',
+        patterns: ['rionegro'],
+        priceCOP: 9000,
+    },
+    {
+        key: 'fontibon',
+        label: 'Edificios de Fontibón',
+        patterns: ['fontibon', 'fontibón'],
+        priceCOP: 10000,
+    },
+    {
+        key: 'aeropuerto',
+        label: 'Aeropuerto JMC',
+        patterns: ['aeropuerto', 'jmc', 'jose maria cordova', 'josé maría córdoba', 'josé maría córdova'],
+        priceCOP: 25000,
+    },
+    {
+        key: 'vereda',
+        label: 'Vereda (tarifa por kilómetro)',
+        patterns: ['vereda'],
+        priceCOP: null, // se cotiza
+    },
+    {
+        key: 'retiro',
+        label: 'El Retiro',
+        patterns: ['retiro'],
+        priceCOP: 30000,
+    },
+    {
+        key: 'guarne',
+        label: 'Guarne',
+        patterns: ['guarne'],
+        priceCOP: 35000,
+    },
+    {
+        key: 'ceja',
+        label: 'La Ceja',
+        patterns: ['la ceja', 'ceja'],
+        priceCOP: 30000,
+    },
+    {
+        key: 'santuario',
+        label: 'El Santuario',
+        patterns: ['santuario'],
+        priceCOP: 30000,
+    },
+    {
+        key: 'marinilla',
+        label: 'Marinilla',
+        patterns: ['marinilla'],
+        priceCOP: 17000,
+    },
+    {
+        key: 'carmen',
+        label: 'El Carmen de Viboral',
+        patterns: ['carmen', 'carmen de viboral'],
+        priceCOP: 22000,
+    },
+    {
+        key: 'medellin',
+        label: 'Medellín (tarifa mínima)',
+        patterns: ['medellin', 'medellín'],
+        priceCOP: 80000,
+    },
+];
+
+function detectShippingZone(text) {
+    const norm = normalize(text);
+    for (const zone of SHIPPING_ZONES) {
+        for (const pat of zone.patterns) {
+            if (norm.includes(pat)) return zone;
+        }
+    }
+    return null;
+}
+
 // ================== Prompt del bot ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, un asistente conversacional para WhatsApp de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia.
@@ -171,11 +309,12 @@ ESTILO
 - Si no entiendes algo, pide aclaración en una sola frase breve.
 - No repitas siempre las mismas frases de cortesía; varía un poco tu forma de saludar y despedirte.
 
-CATÁLOGO DE PRODUCTOS
-- A veces recibirás un mensaje de sistema llamado "Contexto de productos relevantes".
-- Úsalo como referencia de nombres, descripciones y precios, y luego explícale al cliente de forma sencilla.
-- Si el cliente menciona un producto específico, concéntrate en ese producto primero.
-- Si no hay productos relevantes en el contexto, responde igual, como lo harías normalmente, y aclara si no tienes el dato exacto.
+CATÁLOGO DE PRODUCTOS Y PRECIOS
+- Solo puedes considerar como DISPONIBLES los productos que aparezcan en la lista de "productos relevantes del catálogo" que te manda el sistema.
+- Nunca inventes productos ni precios. 
+- Si el usuario pregunta por un producto que NO ves claramente en esa lista, responde que no lo tienes o que no aparece en tu catálogo y ofrece alternativas de la lista.
+- Si el usuario escribe con mala ortografía, intenta inferir qué producto es, pero SIEMPRE verifica contra la lista. Si no coincide, di que no lo tienes.
+- Cuando tengas el precio de un producto en la lista, úsalo tal como está. No cambies el valor.
 
 DOMICILIOS CON VOPU (REFERENCIA)
 Usa estas tarifas como referencia aproximada para domicilios desde el punto de venta en Rionegro. Pueden cambiar con el tiempo, pero te sirven como guía:
@@ -195,10 +334,11 @@ Usa estas tarifas como referencia aproximada para domicilios desde el punto de v
 Si el usuario pregunta por el valor del domicilio:
 - Si menciona una de estas zonas, puedes responder con estos valores como referencia.
 - Si pregunta por otra zona o vereda específica, sugiérele que se cotice con la empresa de mensajería para tener el valor exacto.
+- Si el sistema te da un total calculado (producto + domicilio), úsalo tal cual y explícalo.
 
 IMPORTANTE SOBRE DATOS PERSONALES
 - No exijas dirección, nombre o teléfono si la persona solo está preguntando algo o explorando opciones.
-- Solo si el usuario dice claramente que quiere hacer un pedido o un domicilio, entonces puedes pedir los datos que falten, pero de forma natural, como lo haría un humano.
+- Solo si el usuario dice claramente que quiere hacer un pedido o un domicilio, puedes pedir los datos que falten, pero de forma natural, como lo haría un humano.
 
 GENERAL
 - Si el usuario solo conversa o hace preguntas que no son de la tienda, respóndele igual, como ChatGPT.
@@ -206,8 +346,6 @@ GENERAL
 `.trim();
 
 // ================== Redis helpers ==================
-const keyHistory = (waId) => `chat:wa:${waId}:history`;
-
 async function getHistory(waId) {
     try {
         const raw = await redis.get(keyHistory(waId));
@@ -224,6 +362,24 @@ async function setHistory(waId, history) {
         await redis.set(keyHistory(waId), JSON.stringify(trimmed), 'EX', HISTORY_TTL_SECONDS);
     } catch (e) {
         if (DEBUG) console.error('[REDIS] setHistory:', e && e.message ? e.message : e);
+    }
+}
+
+async function getLastProduct(waId) {
+    try {
+        const raw = await redis.get(keyLastProduct(waId));
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] getLastProduct:', e && e.message ? e.message : e);
+        return null;
+    }
+}
+
+async function setLastProduct(waId, product) {
+    try {
+        await redis.set(keyLastProduct(waId), JSON.stringify(product), 'EX', HISTORY_TTL_SECONDS);
+    } catch (e) {
+        if (DEBUG) console.error('[REDIS] setLastProduct:', e && e.message ? e.message : e);
     }
 }
 
@@ -306,10 +462,14 @@ async function processConversation(userId, waNumber, userText) {
     // Comando de reset manual
     if (/^\s*(reset|reiniciar|nuevo chat|nuevo pedido)\s*$/i.test(userText.trim())) {
         await setHistory(userId, []);
+        await setLastProduct(userId, null);
         return 'Listo, empezamos una conversación nueva. Cuéntame, ¿en qué te ayudo?';
     }
 
+    // Info de contexto extra
     const productContext = buildProductContext(userText);
+    const shippingInfo = detectShippingZone(userText);
+    const lastProduct = await getLastProduct(userId);
 
     const messages = [
         { role: 'system', content: systemPrompt },
@@ -320,6 +480,35 @@ async function processConversation(userId, waNumber, userText) {
             role: 'system',
             content: productContext,
         });
+    }
+
+    if (lastProduct && lastProduct.priceCOP != null) {
+        messages.push({
+            role: 'system',
+            content: `En esta conversación, el último producto que el cliente mostró interés en comprar es ` +
+                `"${lastProduct.name}" con precio ${formatCOP(lastProduct.priceCOP)}. ` +
+                `Si el usuario pregunta por total a enviar o por domicilio y no menciona otro producto distinto, ` +
+                `usa este producto como referencia. No inventes precios distintos.`
+        });
+    }
+
+    if (shippingInfo) {
+        let txt =
+            `Referencia de domicilio detectada: el usuario mencionó la zona "${shippingInfo.label}". `;
+
+        if (shippingInfo.priceCOP != null) {
+            txt += `La tarifa de envío de referencia para esa zona es ${formatCOP(shippingInfo.priceCOP)}. `;
+        } else {
+            txt += `La tarifa de envío para esta zona es por kilómetro y debe cotizarse con la empresa de mensajería. `;
+        }
+
+        if (shippingInfo.priceCOP != null && lastProduct && lastProduct.priceCOP != null) {
+            const total = lastProduct.priceCOP + shippingInfo.priceCOP;
+            txt += `Si el usuario quiere saber cuánto debe enviar por "${lastProduct.name}" más domicilio, ` +
+                `el total aproximado es ${formatCOP(total)} (producto + envío).`;
+        }
+
+        messages.push({ role: 'system', content: txt });
     }
 
     // Añadimos historial previo
@@ -345,6 +534,28 @@ async function processConversation(userId, waNumber, userText) {
         { role: 'assistant', content: reply },
     ];
     await setHistory(userId, newHistory);
+
+    // Guardamos posible último producto principal si parece consulta de compra/precio
+    try {
+        const maybeProd = findRelevantProducts(userText, 1);
+        const lower = userText.toLowerCase();
+        const purchaseIntent = /\b(comprar|comprarme|comprarte|comprarles|quiero comprar|quiero pedir|hacer un pedido|llevarme|precio|vale|cu[aá]nto vale|cu[aá]nto cuesta|a cu[aá]nto)\b/.test(lower);
+
+        if (purchaseIntent && maybeProd.length === 1) {
+            const p = maybeProd[0];
+            const rawPrice = p.precio || p.price || p.valor;
+            const priceCOP = parseCOPnum(rawPrice);
+            if (priceCOP != null) {
+                const name = p.nombre || p.name || p.titulo || 'Producto sin nombre';
+                await setLastProduct(userId, { name, priceCOP });
+                if (DEBUG) {
+                    console.log('[SESSION] lastProduct set:', name, priceCOP);
+                }
+            }
+        }
+    } catch (e) {
+        if (DEBUG) console.error('[SESSION] error setLastProduct:', e && e.message ? e.message : e);
+    }
 
     return reply;
 }
