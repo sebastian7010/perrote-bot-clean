@@ -298,7 +298,7 @@ function detectShippingZone(text) {
 }
 
 // ================== Prompt del bot ==================
-const SYSTEM_PROMPT = `
+const systemPrompt = `
 Eres *Juan Marcos*, el asistente de ventas de la tienda de mascotas "Perrote y Gatote".
 Respondes por WhatsApp a clientes reales, en tono muy humano, amable y claro, como un asesor experto.
 
