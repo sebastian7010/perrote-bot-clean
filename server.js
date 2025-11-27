@@ -22,6 +22,23 @@ process.env.TZ = process.env.TIMEZONE || 'America/Bogota';
 const app = express();
 const PORT = process.env.PORT || 3008;
 
+// ====== Pagos (desde .env) ======
+const NEQUI_ACCOUNT = process.env['BRE-B_NEQUI'] || '0090610545';
+const DAVIVIENDA_ACCOUNT = process.env['BRE-B_DAVIVIENDA'] || '@DAVIPERROTGATOTE';
+
+const PAYMENT_BLOCK =
+    '💳 Opciones de pago:\n' +
+    `• Nequi: ${NEQUI_ACCOUNT}\n` +
+    `• BRE-B: ${DAVIVIENDA_ACCOUNT}`;
+
+const PAYMENT_PROOF_LINE =
+    'Por favor envíame por aquí la *foto del comprobante de pago* para programar el despacho. 🙏';
+
+// ====== UltraMsg config ======
+const ULTRA_BASE_URL = process.env.ULTRA_BASE_URL || 'https://api.ultramsg.com/instance150829/';
+const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
+
+// ====== Middlewares ======
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -30,6 +47,24 @@ const catalogLoaded = loadCatalog();
 const products = catalogLoaded.products;
 const fuse = catalogLoaded.fuse;
 console.log('[CATALOG] items: ' + products.length);
+
+// ========== Helpers numéricos ==========
+
+function parseCOPnum(str) {
+    if (!str) return 0;
+    const digits = String(str).replace(/[^\d]/g, '');
+    if (!digits) return 0;
+    return parseInt(digits, 10);
+}
+
+function calculateSubtotal(items) {
+    if (!Array.isArray(items)) return 0;
+    return items.reduce((sum, it) => {
+        const price = Number(it.price) || 0;
+        const qty = Number(it.qty) || 0;
+        return sum + price * qty;
+    }, 0);
+}
 
 // ========== Helpers de texto ==========
 
@@ -48,69 +83,71 @@ function isFinishOrder(text) {
     return /^(no|no gracias|nada mas|nada más|eso es todo|solo eso|solo seria)/.test(t);
 }
 
-// Detecta si el texto parece un pedido copiado desde la web
-function parseWebOrder(text) {
-    const lines = text
-        .split('\n')
-        .map(function(l) { return l.trim(); })
-        .filter(function(l) { return l.length > 0; });
+// ================== Parseo de carrito web ==================
 
-    const items = [];
+function parseWebCart(text) {
+    const out = { items: [], totalFromText: null };
+    if (!text) return out;
 
-    lines.forEach(function(line) {
-        const mCantidad = line.match(/cantidad[: ]+(\d+)/i);
-        if (!mCantidad) return;
-        const qty = parseInt(mCantidad[1], 10) || 1;
-        const idx = line.toLowerCase().indexOf('cantidad');
-        const rawName = idx > 0 ?
-            line.slice(0, idx).replace(/^[\-\•\*\·#]+/, '').trim() :
-            line.trim();
-        if (!rawName) return;
-        items.push({ rawName: rawName, qty: qty });
-    });
+    const lines = String(text)
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(Boolean);
 
-    if (!items.length) return null;
-    return { items: items };
-}
+    for (const line of lines) {
+        if (!/cantidad\s*[:\-]/i.test(line)) continue;
 
-// Envía mensaje por UltraMsg
-async function sendWhatsAppUltra(to, body) {
-    const baseUrl = process.env.ULTRA_BASE_URL;
-    const token = process.env.ULTRA_TOKEN;
+        // Ejemplos:
+        // "Agility Gold Obesos x 7 kilos Cantidad: 3 Precio unitario: $140.200 Subtotal: $420.600"
+        // "*Agility* Cantidad: 1 Precio unitario: $56.300 Subtotal: $56.300"
+        const m = line.match(
+            /(.+?)\s*Cantidad\s*[:\-]\s*(\d+)\s*.*?Precio\s*unitario\s*[:\-]\s*([\$\d\.,]+)\s*.*?Subtotal\s*[:\-]\s*([\$\d\.,]+)/i
+        );
+        if (!m) continue;
 
-    if (!baseUrl || !token) {
-        console.log('[ULTRA] No configurado, respuesta solo log:', body);
-        return;
-    }
+        let name = m[1].trim();
+        name = name.replace(/^[\-\*\•\d\.\)]+/, '').trim(); // limpia viñetas/numeración
 
-    try {
-        await axios.post(baseUrl + 'messages/chat', null, {
-            params: {
-                token: token,
-                to: to,
-                body: body
-            }
+        const qty = parseInt(m[2], 10);
+        const unit = parseCOPnum(m[3]);
+        const subtotal = parseCOPnum(m[4]);
+
+        if (!name || !Number.isFinite(qty) || !Number.isFinite(unit)) continue;
+
+        out.items.push({
+            rawName: name,
+            name,
+            qty,
+            unit,
+            subtotal: Number.isFinite(subtotal) ? subtotal : qty * unit
         });
-        console.log('[ULTRA] Mensaje enviado a', to);
-    } catch (err) {
-        var detail;
-        if (err && err.response && err.response.data) {
-            detail = err.response.data;
-        } else {
-            detail = err && err.message ? err.message : String(err);
-        }
-        console.error('[ULTRA] Error enviando mensaje:', detail);
     }
+
+    const totalMatch = text.match(/Total\s*a\s*pagar\s*[:\-]\s*([\$\d\.\,]+)/i);
+    if (totalMatch) {
+        out.totalFromText = parseCOPnum(totalMatch[1]);
+    }
+
+    return out;
 }
 
-// Calcula subtotal del carrito
-function calculateSubtotal(cart) {
-    return cart.reduce(function(acc, item) {
-        return acc + item.price * item.qty;
-    }, 0);
+function looksLikeWebCart(text) {
+    if (!text) return false;
+    const hasCantidad = /Cantidad\s*[:\-]\s*\d+/i.test(text);
+    const hasPrecio = /Precio\s*unitario\s*[:\-]\s*[\$\d\.\,]+/i.test(text);
+    const hasSub = /Subtotal\s*[:\-]\s*[\$\d\.\,]+/i.test(text);
+    const hasTotal = /Total\s*a\s*pagar\s*[:\-]\s*[\$\d\.\,]+/i.test(text);
+    return (hasCantidad && hasPrecio && hasSub) || hasTotal;
 }
 
-// ========== Núcleo de lógica de Juan ==========
+function parseWebOrder(text) {
+    if (!looksLikeWebCart(text)) return null;
+    const cart = parseWebCart(text);
+    if (!cart.items.length) return null;
+    return cart;
+}
+
+// ========== Núcleo de lógica del bot ==========
 
 async function handleMessage(wa, text) {
     const rawText = text || '';
@@ -118,7 +155,13 @@ async function handleMessage(wa, text) {
 
     let session = await getSession(wa);
 
-    // Guardar un poquito de contexto como notas
+    // Asegurar estructura básica
+    session.cart = session.cart || [];
+    session.shipping = session.shipping || {};
+    session.notes = session.notes || '';
+    session.stage = session.stage || 'idle';
+
+    // Guardar notas de contexto
     if (
         rawText.length > 20 &&
         /mi perro|mi gato|mi perrito|mi gatito|cachorro|sobrepeso|esterilizado|esterilizada/i.test(rawText)
@@ -126,11 +169,11 @@ async function handleMessage(wa, text) {
         session.notes = (session.notes || '') + ' ' + rawText.trim();
     }
 
-    // 1) Pregunta de identidad IA
+    // 1) Pregunta de identidad IA (branding)
     if (isIAQuestion(rawText)) {
         return (
-            'Sí, soy un asistente creado por un equipo de ingenieros expertos de Tolentino Software para ayudarte con tus compras.\n' +
-            'Si quieres una IA como yo para tu negocio, visita: https://www.tolentinosftw.com/'
+            'Sí, soy un asistente creado por Tolentino Software para ayudarte con tus compras en Perrote y Gatote.\n' +
+            'Si quieres una IA como esta para tu negocio, visita: https://www.tolentinosftw.com/'
         );
     }
 
@@ -179,9 +222,7 @@ async function handleMessage(wa, text) {
     const qty = detectQuantity(rawText);
 
     // Agregar al carrito
-    const existing = session.cart.find(function(i) {
-        return i.productId === best.id;
-    });
+    const existing = session.cart.find(i => i.productId === best.id);
 
     if (existing) {
         existing.qty += qty;
@@ -205,12 +246,13 @@ async function handleMessage(wa, text) {
         ' por $' +
         best.price.toLocaleString('es-CO') +
         ' c/u.';
-    const line2 = '¿Quieres agregar algo más?';
+    const line2 = '¿Quieres agregar algo más o pasamos a los datos de envío? (Escríbeme "no" si ya está bien así)';
 
     return line1 + '\n' + line2;
 }
 
-// Manejo de flujo de datos de envío
+// ========== Manejo de flujo de datos de envío ==========
+
 async function handleShippingFlow(wa, rawText, session) {
     const t = rawText.trim();
 
@@ -262,16 +304,13 @@ async function handleShippingFlow(wa, rawText, session) {
 
     if (session.stage === 'collect-extra') {
         session.shipping.extra = t;
-        session.stage = 'ready-to-confirm';
+        session.stage = 'completed';
 
         const subtotal = calculateSubtotal(session.cart);
         const shippingCost = session.shipping.shippingCost || 0;
         const total = subtotal + shippingCost;
 
         await saveSession(wa, session);
-
-        const nequi = process.env['BRE-B_NEQUI'] || '0090610545';
-        const daviplata = process.env['BRE-B_DAVIVIENDA'] || '@DAVIPERROTGATOTE';
 
         const line1 = 'Súper, ya tengo todo listo.';
         const line2 =
@@ -286,18 +325,24 @@ async function handleShippingFlow(wa, rawText, session) {
             '\n' +
             '💰 Total a pagar: $' +
             total.toLocaleString('es-CO');
-        const line3 =
-            '💳 Opciones de pago:\n' +
-            '• Nequi: ' +
-            nequi +
-            '\n' +
-            '• BRE-B: ' +
-            daviplata;
-        const line5 =
-            'Por favor envíame por aquí la foto del comprobante de pago para programar el despacho. 🙏';
-        const line4 =
-            'Si quieres, también puedo ayudarte con recomendaciones de entrenamiento o cuidado para tu mascota. 🐶🐱';
 
+        const resumenEnvio =
+            '\n📦 Datos de envío:\n' +
+            '• Nombre: ' +
+            (session.shipping.name || '-') +
+            '\n' +
+            '• Celular: ' +
+            (session.shipping.phone || wa) +
+            '\n' +
+            '• Dirección: ' +
+            (session.shipping.address || '-') +
+            '\n' +
+            '• Ciudad: ' +
+            (session.shipping.city || '-') +
+            '\n' +
+            (session.shipping.extra ? '• Referencias: ' + session.shipping.extra + '\n' : '');
+
+        // Enviar al Telegram interno
         await sendOrderToTelegram({
             customerName: session.shipping.name,
             phone: session.shipping.phone || wa,
@@ -311,18 +356,31 @@ async function handleShippingFlow(wa, rawText, session) {
             notes: session.notes
         });
 
-        session.stage = 'completed';
-        await saveSession(wa, session);
+        // Mensaje al cliente SIEMPRE con cuentas + comprobante
+        const reply =
+            line1 +
+            '\n' +
+            line2 +
+            '\n' +
+            resumenEnvio +
+            '\n' +
+            PAYMENT_BLOCK +
+            '\n\n' +
+            PAYMENT_PROOF_LINE +
+            '\n\n' +
+            'Si quieres, también puedo ayudarte con recomendaciones de entrenamiento o cuidado para tu mascota. 🐶🐱';
 
-        return line1 + '\n' + line2 + '\n\n' + line3 + '\n\n' + line5 + '\n\n' + line4;
+        return reply;
     }
 
+    // Cualquier otra cosa, reseteamos
     session.stage = 'idle';
     await saveSession(wa, session);
     return 'Listo, volvamos a empezar. Cuéntame qué necesitas para tu mascota.';
 }
 
-// Manejo de pedido copiado desde la web
+// ========== Manejo de pedido copiado desde la web ==========
+
 async function handleWebOrder(wa, webOrder, session) {
     const items = webOrder.items;
     const recognized = [];
@@ -332,7 +390,7 @@ async function handleWebOrder(wa, webOrder, session) {
         // 1) Intento estricto
         let matches = searchProductsByText(it.rawName, fuse, 1);
 
-        // 2) Si no encuentra nada, uso modo LOSE para pedidos web
+        // 2) Si no encuentra nada, uso modo LOOSE para pedidos web
         if (!matches.length) {
             matches = searchProductsByTextLoose(it.rawName, fuse, 1);
         }
@@ -383,13 +441,31 @@ async function handleWebOrder(wa, webOrder, session) {
         notFound.forEach(function(n) {
             lines.push('• ' + n);
         });
-        lines.push('\nEste producto no está disponible, pero puedo sugerirte otros similares para reemplazarlo.');
+        lines.push('\nPuedo sugerirte otros productos similares para reemplazarlos.');
     }
 
     lines.push('\nPara continuar con el envío, por favor dime:');
     lines.push('1️⃣ Nombre completo:');
 
     return lines.join('\n');
+}
+
+// ========== Envío de mensajes por UltraMsg ==========
+
+async function sendWhatsAppUltra(to, message) {
+    if (!ULTRA_TOKEN) {
+        console.error('[ULTRA] Falta ULTRA_TOKEN en .env');
+        return;
+    }
+    try {
+        await axios.post(ULTRA_BASE_URL + 'messages/chat', {
+            token: ULTRA_TOKEN,
+            to: String(to).replace(/^whatsapp:/, ''),
+            body: message
+        });
+    } catch (err) {
+        console.error('[ULTRA] Error al enviar mensaje:', err && err.response ? err.response.data : err.message);
+    }
 }
 
 // ========== Rutas HTTP ==========
@@ -416,7 +492,7 @@ app.post('/ultra-webhook', async function(req, res) {
 
         res.sendStatus(200);
     } catch (err) {
-        var detail;
+        let detail;
         if (err && err.response && err.response.data) {
             detail = err.response.data;
         } else {
