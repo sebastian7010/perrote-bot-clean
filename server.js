@@ -7,6 +7,7 @@ const axios = require('axios');
 const {
     loadCatalog,
     searchProductsByText,
+    searchProductsByTextLoose,
     detectQuantity,
     detectAnimal,
     normalizeText
@@ -74,7 +75,7 @@ function parseWebOrder(text) {
 
 // Envía mensaje por UltraMsg
 async function sendWhatsAppUltra(to, body) {
-    const baseUrl = process.env.ULTRA_BASE_URL; // ej: https://api.ultramsg.com/instance150829/
+    const baseUrl = process.env.ULTRA_BASE_URL;
     const token = process.env.ULTRA_TOKEN;
 
     if (!baseUrl || !token) {
@@ -167,11 +168,10 @@ async function handleMessage(wa, text) {
         }
     }
 
-    // Buscar producto en catálogo
+    // Buscar producto en catálogo (modo estricto)
     const matches = searchProductsByText(rawText, fuse, 3);
 
     if (!matches.length) {
-        // NO inventamos producto
         return 'Este producto no está disponible, pero puedo sugerirte otros similares.';
     }
 
@@ -238,7 +238,6 @@ async function handleShippingFlow(wa, rawText, session) {
     if (session.stage === 'collect-city' || session.stage === 'await-alt-city') {
         const shippingInfo = getShippingForCity(t);
         if (!shippingInfo) {
-            // Si ya le dijimos que no y vuelve a decir "no tengo", cancelamos
             if (session.stage === 'await-alt-city' && /no/.test(normalizeText(t))) {
                 session.stage = 'cancelled';
                 await saveSession(wa, session);
@@ -294,10 +293,11 @@ async function handleShippingFlow(wa, rawText, session) {
             '\n' +
             '• BRE-B: ' +
             daviplata;
+        const line5 =
+            'Por favor envíame por aquí la foto del comprobante de pago para programar el despacho. 🙏';
         const line4 =
             'Si quieres, también puedo ayudarte con recomendaciones de entrenamiento o cuidado para tu mascota. 🐶🐱';
 
-        // Enviar a Telegram
         await sendOrderToTelegram({
             customerName: session.shipping.name,
             phone: session.shipping.phone || wa,
@@ -314,10 +314,9 @@ async function handleShippingFlow(wa, rawText, session) {
         session.stage = 'completed';
         await saveSession(wa, session);
 
-        return line1 + '\n' + line2 + '\n\n' + line3 + '\n\n' + line4;
+        return line1 + '\n' + line2 + '\n\n' + line3 + '\n\n' + line5 + '\n\n' + line4;
     }
 
-    // Fallback por si algo raro pasa
     session.stage = 'idle';
     await saveSession(wa, session);
     return 'Listo, volvamos a empezar. Cuéntame qué necesitas para tu mascota.';
@@ -330,11 +329,19 @@ async function handleWebOrder(wa, webOrder, session) {
     const notFound = [];
 
     items.forEach(function(it) {
-        const matches = searchProductsByText(it.rawName, fuse, 1);
+        // 1) Intento estricto
+        let matches = searchProductsByText(it.rawName, fuse, 1);
+
+        // 2) Si no encuentra nada, uso modo LOSE para pedidos web
+        if (!matches.length) {
+            matches = searchProductsByTextLoose(it.rawName, fuse, 1);
+        }
+
         if (!matches.length) {
             notFound.push(it.rawName);
             return;
         }
+
         const best = matches[0].product;
         recognized.push({
             productId: best.id,
@@ -391,7 +398,6 @@ app.get('/', function(req, res) {
     res.send('Perrote y Gatote · Bot Juan activo 🐶🐱');
 });
 
-// Webhook de UltraMsg
 app.post('/ultra-webhook', async function(req, res) {
     try {
         const body = req.body || {};
