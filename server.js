@@ -467,22 +467,27 @@ async function handleWebOrder(wa, webOrder, session) {
 }
 
 // ========== Envío de mensajes por UltraMsg ==========
-
 async function sendWhatsAppUltra(to, message) {
     if (!ULTRA_TOKEN) {
         console.error('[ULTRA] Falta ULTRA_TOKEN en .env');
         return;
     }
     try {
+        const toClean = String(to)
+            .replace(/^whatsapp:/, '')
+            .replace(/@c\.us$/, '')
+            .trim();
+
         await axios.post(ULTRA_BASE_URL + 'messages/chat', {
             token: ULTRA_TOKEN,
-            to: String(to).replace(/^whatsapp:/, ''),
+            to: toClean,
             body: message
         });
     } catch (err) {
         console.error('[ULTRA] Error al enviar mensaje:', err && err.response ? err.response.data : err.message);
     }
 }
+
 
 // ========== Rutas HTTP ==========
 
@@ -494,24 +499,39 @@ app.get('/', function(req, res) {
 app.get('/health', function(req, res) {
     res.status(200).send('OK');
 });
-
 app.post('/ultra-webhook', async function(req, res) {
     try {
         const body = req.body || {};
-        const from = body.from || body.waId || '';
-        const text = body.body || body.text || body.message || '';
+        const data = body.data || {};
+
+        // UltraMsg a veces manda from/body en la raíz, otras dentro de data
+        let from = body.from || body.waId || data.from || '';
+        let text = body.body || body.text || body.message || data.body || '';
+
+        // Limpiar formatos tipo "whatsapp:+57..." o "57310...@c.us"
+        from = String(from)
+            .replace(/^whatsapp:/, '')
+            .replace(/@c\.us$/, '')
+            .trim();
 
         if (!from) {
             console.log('[WEBHOOK] sin from, body:', body);
             return res.sendStatus(200);
         }
 
-        console.log('[INCOMING]', { from: from, text: text });
+        // Si viene vacío el texto, no hay nada que procesar
+        if (!text) {
+            console.log('[WEBHOOK] sin text, body:', body);
+            return res.sendStatus(200);
+        }
+
+        console.log('[INCOMING]', { from, text });
 
         const reply = await handleMessage(from, text);
+
         await sendWhatsAppUltra(from, reply);
 
-        // Útil para pruebas con curl
+        // Útil para pruebas con curl o para ver qué respondió el bot
         return res.json({
             ok: true,
             from,
@@ -529,6 +549,7 @@ app.post('/ultra-webhook', async function(req, res) {
         return res.status(200).json({ ok: false, error: detail });
     }
 });
+
 
 app.listen(PORT, function() {
     console.log('Server on http://localhost:' + PORT + ' | TZ=' + process.env.TZ);
