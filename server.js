@@ -1,4 +1,3 @@
-// @ts-nocheck
 // ================== Boot & safety ==================
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', (e && e.stack) || e));
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', (e && e.stack) || e));
@@ -11,7 +10,6 @@ const express = require('express');
 const OpenAI = require('openai');
 const IORedis = require('ioredis');
 const axios = require('axios');
-
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -27,6 +25,11 @@ const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '1200', 10);
 
 const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
 const BOT_NAME = process.env.BOT_NAME || 'Asesor';
+
+// === DATOS DE PAGO (NUEVO) ===
+// Leemos las variables exactas de tu .env
+const NEQUI_NUM = process.env['BRE-B_NEQUI'] || 'No disponible';
+const DAVI_NUM = process.env['BRE-B_DAVIVIENDA'] || 'No disponible';
 
 // Redis para historial de chat
 const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
@@ -44,7 +47,7 @@ if (DEBUG) {
     console.log('[CFG] PORT=', PORT);
     console.log('[CFG] TIMEZONE=', TIMEZONE);
     console.log('[CFG] MODEL=', OPENAI_MODEL);
-    console.log('[CFG] ULTRA_BASE_URL=', ULTRA_BASE_URL);
+    console.log('[CFG] NEQUI=', NEQUI_NUM); // Para verificar en consola
 }
 
 // ================== OpenAI client ==================
@@ -102,14 +105,12 @@ function findRelevantProducts(query, maxResults = 5) {
     if (!tokens.length) return [];
 
     const scored = [];
-
     for (const p of CATALOG) {
         const name = p.nombre || p.name || p.titulo || '';
         const desc = p.descripcion || p.description || '';
         const brand = p.marca || p.brand || '';
         const cat = p.categoria || p.category || '';
         const haystack = normalize(name + ' ' + desc + ' ' + brand + ' ' + cat);
-
         let score = 0;
         for (const t of tokens) {
             if (haystack.includes(t)) score++;
@@ -152,14 +153,12 @@ function buildProductContext(userText) {
         if (desc) line += `. ${desc}`;
         lines.push(line);
     });
-
     return lines.join('\n');
 }
 
-// ================== Prompt del bot ==================
+// ================== Prompt del bot (MODIFICADO) ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, un asistente conversacional para WhatsApp de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia.
-
 Te comportas como ChatGPT:
 - Puedes hablar de cualquier tema que el usuario necesite (mascotas, compras, dudas generales, vida personal, etc.).
 - Siempre respondes en español, con tono amable, claro y respetuoso.
@@ -175,15 +174,12 @@ CATÁLOGO DE PRODUCTOS
 - A veces recibirás un mensaje de sistema llamado "Contexto de productos relevantes".
 - Úsalo como referencia de nombres, descripciones y precios, y luego explícale al cliente de forma sencilla.
 - Si el cliente menciona un producto específico, concéntrate en ese producto primero.
-- Si no hay productos relevantes en el contexto, responde igual, como lo harías normalmente, y aclara si no tienes el dato exacto.
 
 DOMICILIOS CON VOPU (REFERENCIA)
-Usa estas tarifas como referencia aproximada para domicilios desde el punto de venta en Rionegro. Pueden cambiar con el tiempo, pero te sirven como guía:
-
+Usa estas tarifas como referencia aproximada para domicilios desde el punto de venta en Rionegro:
 - Rionegro urbano (mínima): $9.000
 - Edificios de Fontibón: $10.000
 - Aeropuerto (JMC): $25.000
-- Veredas: se cobra por kilómetro, se debe cotizar.
 - El Retiro: $30.000
 - Guarne: $35.000
 - La Ceja: $30.000
@@ -191,23 +187,27 @@ Usa estas tarifas como referencia aproximada para domicilios desde el punto de v
 - Marinilla: $17.000
 - El Carmen de Viboral: $22.000
 - Medellín: tarifa mínima alrededor de $80.000
+Si es otra zona, sugiere cotizar.
 
-Si el usuario pregunta por el valor del domicilio:
-- Si menciona una de estas zonas, puedes responder con estos valores como referencia.
-- Si pregunta por otra zona o vereda específica, sugiérele que se cotice con la empresa de mensajería para tener el valor exacto.
+MEDIOS DE PAGO Y CIERRE (IMPORTANTE)
+Cuando el cliente confirme que quiere comprar y pregunte cómo pagar o pida la cuenta, dales ÚNICAMENTE esta información exacta:
+- **Nequi:** ${NEQUI_NUM}
+- **Davivienda:** ${DAVI_NUM}
+- **Titular:** ${COMPANY_NAME}
 
-IMPORTANTE SOBRE DATOS PERSONALES
-- No exijas dirección, nombre o teléfono si la persona solo está preguntando algo o explorando opciones.
-- Solo si el usuario dice claramente que quiere hacer un pedido o un domicilio, entonces puedes pedir los datos que falten, pero de forma natural, como lo haría un humano.
+INMEDIATAMENTE después de dar los datos bancarios, diles:
+"Por favor, envíame el comprobante de pago para procesar tu despacho."
+(No pidas la dirección todavía, primero asegura el pago y el comprobante).
 
-GENERAL
-- Si el usuario solo conversa o hace preguntas que no son de la tienda, respóndele igual, como ChatGPT.
-- Tu objetivo es ayudar, no presionar la venta.
+DATOS DE ENVÍO
+Una vez el cliente haya enviado el comprobante (imagen o confirmación), entonces sí pídeles amablemente:
+1. Nombre completo
+2. Dirección exacta (con unidad/apartamento si aplica)
+3. Teléfono de contacto
 `.trim();
 
 // ================== Redis helpers ==================
 const keyHistory = (waId) => `chat:wa:${waId}:history`;
-
 async function getHistory(waId) {
     try {
         const raw = await redis.get(keyHistory(waId));
@@ -246,7 +246,6 @@ function withTimeout(promise, ms) {
 async function askOpenAI(messages) {
     const maxTokens = OPENAI_MAX_TOKENS;
     const temperature = 0.5;
-
     if (DEBUG) {
         console.log('[AI] mensajes enviados:', messages.length);
     }
@@ -260,7 +259,6 @@ async function askOpenAI(messages) {
         }),
         OPENAI_TIMEOUT_MS
     );
-
     const choice = resp && resp.choices && resp.choices[0];
     const text = choice && choice.message && choice.message.content ? String(choice.message.content).trim() : '';
     if (!text) throw new Error('Respuesta vacía de OpenAI');
@@ -278,13 +276,11 @@ async function sendUltraText(waNumber, body) {
         if (!waNumber || !body) return;
 
         const to = String(waNumber).replace(/[^\d]/g, '');
-
         const params = new URLSearchParams();
         params.append('token', ULTRA_TOKEN);
         params.append('to', to);
         params.append('body', body);
         params.append('priority', '10');
-
         const resp = await axios.post(
             `${ULTRA_BASE_URL}/messages/chat`,
             params.toString(), {
@@ -292,7 +288,6 @@ async function sendUltraText(waNumber, body) {
                 timeout: 20000,
             }
         );
-
         if (DEBUG) console.log('[ULTRA][SEND] OK', resp.data);
     } catch (e) {
         console.error('[ULTRA][SEND] error:', e && e.message ? e.message : e);
@@ -302,7 +297,6 @@ async function sendUltraText(waNumber, body) {
 // ================== Lógica de conversación ==================
 async function processConversation(userId, waNumber, userText) {
     const history = await getHistory(userId);
-
     // Comando de reset manual
     if (/^\s*(reset|reiniciar|nuevo chat|nuevo pedido)\s*$/i.test(userText.trim())) {
         await setHistory(userId, []);
@@ -310,11 +304,9 @@ async function processConversation(userId, waNumber, userText) {
     }
 
     const productContext = buildProductContext(userText);
-
     const messages = [
         { role: 'system', content: systemPrompt },
     ];
-
     if (productContext) {
         messages.push({
             role: 'system',
@@ -367,10 +359,13 @@ async function handleUltraWebhook(req, res) {
 
         let bodyText = data.body || '';
         const type = data.type || 'chat';
-
         if (!bodyText) {
             if (type && type !== 'chat') {
-                bodyText = `[Mensaje de tipo ${type} recibido sin texto]`;
+                bodyText = `[Mensaje de tipo ${type} recibido]`; // Simplificado
+                // Si es imagen, podrías detectar type === 'image' para agradecer el comprobante
+                if (type === 'image' || type === 'document') {
+                    bodyText = `[El cliente envió una imagen/documento (posible comprobante)]`;
+                }
             } else {
                 console.error('[ULTRA][WEBHOOK] body vacío');
                 return res.status(200).json({ ok: false, reason: 'empty_body' });
@@ -383,7 +378,6 @@ async function handleUltraWebhook(req, res) {
         }
 
         const userId = 'ultra:' + waNumber;
-
         if (DEBUG) {
             console.log('IN ULTRA >>', userId, '|', bodyText.slice(0, 140));
         }
@@ -391,7 +385,6 @@ async function handleUltraWebhook(req, res) {
         const finalReply = await processConversation(userId, waNumber, bodyText);
 
         await sendUltraText(waNumber, finalReply);
-
         if (DEBUG) {
             console.log('OUT ULTRA << len =', finalReply.length);
         }
@@ -405,8 +398,6 @@ async function handleUltraWebhook(req, res) {
 
 // Ruta principal de UltraMsg
 app.post('/ultra-webhook', handleUltraWebhook);
-
-// Alias opcional por si configuraste la URL del webhook solo con el dominio
 app.post('/', handleUltraWebhook);
 
 // ================== Health check ==================
