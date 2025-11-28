@@ -211,8 +211,24 @@ async function handleMessage(wa, text) {
         }
     }
 
-    // Buscar producto en catálogo (modo estricto)
-    const matches = searchProductsByText(rawText, fuse, 3);
+    // --- Preparar texto de búsqueda limpiando la frase del usuario ---
+    let searchText = rawText;
+
+    // Si el texto empieza con "quiero comprar ..." uso solo lo que viene después
+    const mComprar = rawText.match(/quiero\s+comprar\s+(.+)/i);
+    if (mComprar) {
+        searchText = mComprar[1];
+    }
+
+    // Si al final viene "por $56,300" o similar, se lo quito
+    searchText = searchText.replace(/por\s+[\$\d\.\,]+/i, '').trim();
+
+    // Buscar producto en catálogo (primero estricto, luego loose)
+    let matches = searchProductsByText(searchText || rawText, fuse, 3);
+
+    if (!matches.length) {
+        matches = searchProductsByTextLoose(searchText || rawText, fuse, 5);
+    }
 
     if (!matches.length) {
         return 'Este producto no está disponible, pero puedo sugerirte otros similares.';
@@ -474,6 +490,11 @@ app.get('/', function(req, res) {
     res.send('Perrote y Gatote · Bot Juan activo 🐶🐱');
 });
 
+// Health check para Render
+app.get('/health', function(req, res) {
+    res.status(200).send('OK');
+});
+
 app.post('/ultra-webhook', async function(req, res) {
     try {
         const body = req.body || {};
@@ -490,7 +511,13 @@ app.post('/ultra-webhook', async function(req, res) {
         const reply = await handleMessage(from, text);
         await sendWhatsAppUltra(from, reply);
 
-        res.sendStatus(200);
+        // Útil para pruebas con curl
+        return res.json({
+            ok: true,
+            from,
+            sentText: text,
+            botReply: reply
+        });
     } catch (err) {
         let detail;
         if (err && err.response && err.response.data) {
@@ -499,7 +526,7 @@ app.post('/ultra-webhook', async function(req, res) {
             detail = err && err.message ? err.message : String(err);
         }
         console.error('[WEBHOOK] Error:', detail);
-        res.sendStatus(200);
+        return res.status(200).json({ ok: false, error: detail });
     }
 });
 
