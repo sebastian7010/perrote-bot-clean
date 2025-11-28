@@ -1,437 +1,364 @@
-// ================== Boot & safety ==================
-process.on('uncaughtException', (e) => console.error('[uncaughtException]', (e && e.stack) || e));
-process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', (e && e.stack) || e));
-
-// ================== Setup básico ==================
+// server.js
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
+
 const express = require('express');
-const OpenAI = require('openai');
-const IORedis = require('ioredis');
 const axios = require('axios');
+
+const {
+    loadCatalog,
+    normalizeText,
+} = require('./lib/catalog');
+
+const { getSession, saveSession, resetSession } = require('./lib/session');
+const { sendOrderToTelegram } = require('./lib/telegram');
+
+process.env.TZ = process.env.TIMEZONE || 'America/Bogota';
+
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-
-// ================== Config ==================
 const PORT = process.env.PORT || 3008;
-const TIMEZONE = process.env.TIMEZONE || 'America/Bogota';
-const DEBUG = String(process.env.DEBUG || '1') === '1';
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '10000', 10);
-const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '1200', 10);
-
+// Config bot / OpenAI
+const BOT_NAME = process.env.BOT_NAME || 'Asesor Virtual';
 const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
-const BOT_NAME = process.env.BOT_NAME || 'Asesor';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
-// === DATOS DE PAGO (NUEVO) ===
-// Leemos las variables exactas de tu .env
-const NEQUI_NUM = process.env['BRE-B_NEQUI'] || 'No disponible';
-const DAVI_NUM = process.env['BRE-B_DAVIVIENDA'] || 'No disponible';
+// Middlewares
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// Redis para historial de chat
-const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
-const HISTORY_TTL_SECONDS = (parseInt(process.env.MEMORY_TTL_DAYS, 10) || 30) * 24 * 60 * 60;
-const HISTORY_MAX_MESSAGES = 24;
+// Cargar catálogo
+const catalogLoaded = loadCatalog();
+const products = catalogLoaded.products || [];
+const fuse = catalogLoaded.fuse || null;
+console.log('[CATALOG] items:', products.length);
 
-// UltraMsg
-const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID || '';
-const ULTRA_TOKEN = process.env.ULTRA_TOKEN || '';
-const ULTRA_BASE_URL =
-    process.env.ULTRA_BASE_URL ||
-    (ULTRA_INSTANCE_ID ? `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}` : '');
-
-if (DEBUG) {
-    console.log('[CFG] PORT=', PORT);
-    console.log('[CFG] TIMEZONE=', TIMEZONE);
-    console.log('[CFG] MODEL=', OPENAI_MODEL);
-    console.log('[CFG] NEQUI=', NEQUI_NUM); // Para verificar en consola
-}
-
-// ================== OpenAI client ==================
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ================== Catálogo (products.json) ==================
-const CATALOG_PATH = path.join(__dirname, 'data', 'products.json');
-let CATALOG = [];
-
-function loadCatalog() {
-    try {
-        if (fs.existsSync(CATALOG_PATH)) {
-            const raw = fs.readFileSync(CATALOG_PATH, 'utf8');
-            CATALOG = JSON.parse(raw);
-            if (DEBUG) console.log('[CATALOG] cargados', CATALOG.length, 'productos');
-        } else {
-            console.warn('[CATALOG] No se encontró data/products.json, el bot no tendrá info de productos.');
-            CATALOG = [];
-        }
-    } catch (e) {
-        console.error('[CATALOG] error al cargar products.json:', e && e.message ? e.message : e);
-        CATALOG = [];
-    }
-}
-loadCatalog();
-
-function normalize(str) {
-    return (str || '')
-        .toString()
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase();
-}
-
-function parseCOPnum(v) {
-    if (v == null) return null;
-    const digits = String(v).replace(/[^\d]/g, '');
-    const n = Number(digits);
-    return Number.isFinite(n) ? n : null;
-}
-
-function formatCOP(n) {
-    try {
-        return '$' + Number(n).toLocaleString('es-CO');
-    } catch {
-        return '$' + n;
-    }
-}
-
-// Encuentra productos relevantes según el texto del usuario
-function findRelevantProducts(query, maxResults = 5) {
-    if (!query || !CATALOG.length) return [];
-    const qNorm = normalize(query);
-    const tokens = qNorm.split(/\s+/).filter(t => t.length > 2);
-    if (!tokens.length) return [];
-
-    const scored = [];
-    for (const p of CATALOG) {
-        const name = p.nombre || p.name || p.titulo || '';
-        const desc = p.descripcion || p.description || '';
-        const brand = p.marca || p.brand || '';
-        const cat = p.categoria || p.category || '';
-        const haystack = normalize(name + ' ' + desc + ' ' + brand + ' ' + cat);
-        let score = 0;
-        for (const t of tokens) {
-            if (haystack.includes(t)) score++;
-        }
-
-        if (score > 0) {
-            scored.push({ prod: p, score });
-        }
-    }
-
-    if (!scored.length) return [];
-
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, maxResults).map(x => x.prod);
-}
-
-// Construye un mensaje de sistema con contexto de productos relevantes
-function buildProductContext(userText) {
-    const prods = findRelevantProducts(userText, 5);
-    if (!prods.length) return null;
-
-    const lines = [];
-    lines.push(
-        'Contexto de productos relevantes del catálogo de Perrote y Gatote. ' +
-        'Úsalo solo como referencia interna: no es necesario mostrar toda esta lista al cliente, ' +
-        'solo mencionar los productos que realmente apliquen.'
-    );
-    lines.push('');
-
-    prods.forEach((p, idx) => {
-        const name = p.nombre || p.name || p.titulo || 'Producto sin nombre';
-        const brand = p.marca || p.brand || '';
-        const rawPrice = p.precio || p.price || p.valor || null;
-        const nPrice = parseCOPnum(rawPrice);
-        const price = nPrice != null ? formatCOP(nPrice) : 'precio no disponible';
-        const desc = p.descripcion || p.description || '';
-
-        let line = `${idx + 1}. ${name} — ${price}`;
-        if (brand) line += ` — ${brand}`;
-        if (desc) line += `. ${desc}`;
-        lines.push(line);
-    });
-    return lines.join('\n');
-}
-
-// ================== Prompt del bot (MODIFICADO) ==================
+// ================== PROMPT DEL BOT ==================
 const systemPrompt = `
-Eres ${BOT_NAME}, un asistente conversacional para WhatsApp de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia.
-Te comportas como ChatGPT:
-- Puedes hablar de cualquier tema que el usuario necesite (mascotas, compras, dudas generales, vida personal, etc.).
-- Siempre respondes en español, con tono amable, claro y respetuoso.
-- No usas mensajes pre-armados ni bloques repetitivos; escribes de forma natural como una persona real.
+Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
+
+TU ROL Y LÍMITES
+- Tu único rol es ser un asesor de ventas de Perrote y Gatote.
+- Ayudas a elegir productos, armar pedidos y resolver dudas básicas de cuidado y entrenamiento de mascotas.
+- No das diagnósticos médicos ni recomiendas tratamientos, medicamentos ni dosis para animales ni personas.
+- Ante temas de salud, solo puedes decir que lo mejor es ir al veterinario o a un profesional de confianza.
 
 ESTILO
-- Responde en párrafos cortos (2–5 líneas) para que sea fácil de leer en WhatsApp.
-- Puedes usar uno o dos emojis cuando sea natural, pero no abuses.
-- Si no entiendes algo, pide aclaración en una sola frase breve.
-- No repitas siempre las mismas frases de cortesía; varía un poco tu forma de saludar y despedirte.
+- Tu tono es muy profesional, amable y respetuoso.
+- Escribes en español neutro, sin groserías.
+- Respondes en párrafos cortos de 2 a 5 líneas, cómodos para leer en WhatsApp.
+- Puedes usar uno o dos emojis cuando quede natural, sin abusar.
+- No pides que el cliente responda todo en un solo mensaje; puedes hacer preguntas por partes.
+- Varías tus saludos y despedidas; no repites siempre las mismas frases.
 
-CATÁLOGO DE PRODUCTOS
-- A veces recibirás un mensaje de sistema llamado "Contexto de productos relevantes".
-- Úsalo como referencia de nombres, descripciones y precios, y luego explícale al cliente de forma sencilla.
-- Si el cliente menciona un producto específico, concéntrate en ese producto primero.
+CATÁLOGO Y PRECIOS
+- El catálogo viene de un archivo interno con productos que tienen nombre, precio, marca, categoría y descripción.
+- A veces recibirás un mensaje de sistema llamado "Contexto de productos relevantes" con uno o varios productos.
+- No repites ese contexto literal; lo lees, lo entiendes y luego se lo explicas al cliente con tus propias palabras.
+- Si el contexto incluye precio, siempre usas ese precio tal cual. No inventas, no aproximas, no regateas y no ofreces descuentos ni promociones.
+- Si el cliente pide un producto que:
+  - Está en el contexto: te concentras en ese producto y aclaras presentación, tamaño y para qué sirve.
+  - No está en el contexto pero existe en el catálogo: puedes describirlo de forma general sin inventar datos.
+  - No lo manejas: dices claramente que no lo manejan y sugieres uno o dos productos similares, sin insistir demasiado.
+- Haces preguntas simples sobre la mascota (especie, edad, tamaño, estilo de vida) para recomendar mejor.
 
-DOMICILIOS CON VOPU (REFERENCIA)
-Usa estas tarifas como referencia aproximada para domicilios desde el punto de venta en Rionegro:
-- Rionegro urbano (mínima): $9.000
-- Edificios de Fontibón: $10.000
-- Aeropuerto (JMC): $25.000
-- El Retiro: $30.000
-- Guarne: $35.000
-- La Ceja: $30.000
-- El Santuario: $30.000
-- Marinilla: $17.000
-- El Carmen de Viboral: $22.000
-- Medellín: tarifa mínima alrededor de $80.000
-Si es otra zona, sugiere cotizar.
+VENTAS CRUZADAS
+- Cuando el cliente ya tiene claro su pedido y estás cerca de cerrar, puedes sugerir una sola vez productos complementarios.
+- Para gatos puedes mencionar churu, snacks, arena o juguetes.
+- Para perros puedes mencionar snacks, shampoo, antipulgas o juguetes.
+- Lo haces de forma suave, por ejemplo:
+  "Si quieres, también puedo agregar algún snack o arena para tu gatito, pero solo si te sirve 😊".
+- No hostigas al cliente con ventas cruzadas ni repites la oferta varias veces.
 
-MEDIOS DE PAGO Y CIERRE (IMPORTANTE)
-Cuando el cliente confirme que quiere comprar y pregunte cómo pagar o pida la cuenta, dales ÚNICAMENTE esta información exacta:
-- **Nequi:** ${NEQUI_NUM}
-- **Davivienda:** ${DAVI_NUM}
-- **Titular:** ${COMPANY_NAME}
+ENVÍOS Y DOMICILIOS (DESDE RIONEGRO)
+- Solo manejas domicilios que salen desde el punto de venta en Rionegro.
+- No se hacen envíos a veredas; si preguntan por vereda, explicas con respeto que por ahora no se hacen esos envíos.
+- Tarifas fijas de domicilio:
+  - Rionegro urbano: $9.000
+  - Edificios de Fontibón: $10.000
+  - Aeropuerto JMC: $25.000
+  - El Retiro: $30.000
+  - Guarne: $35.000
+  - La Ceja: $30.000
+  - El Santuario: $30.000
+  - Marinilla: $17.000
+  - El Carmen de Viboral: $22.000
+  - Medellín (zona urbana): $22.000
+- Usas estos valores como fijos.
+- Si el cliente pregunta por un lugar que no está en la lista, explicas que por ahora solo manejan envíos a Rionegro y a esos municipios y que, si tiene otra dirección allí, con gusto lo ayudas.
 
-INMEDIATAMENTE después de dar los datos bancarios, diles:
-"Por favor, envíame el comprobante de pago para procesar tu despacho."
-(No pidas la dirección todavía, primero asegura el pago y el comprobante).
+HORARIOS DE DESPACHO
+- Los despachos se programan a partir de las 12:00 p.m. una vez recibido el comprobante de pago.
+- Puedes decir que se tratará de que el pedido llegue lo antes posible o en el rango que el cliente prefiera, pero sin prometer una hora exacta.
+- Puedes usar frases como:
+  "Desde que recibimos el comprobante, programamos el despacho desde las 12 p.m. y tratamos de que llegue lo más pronto posible."
 
-DATOS DE ENVÍO
-Una vez el cliente haya enviado el comprobante (imagen o confirmación), entonces sí pídeles amablemente:
-1. Nombre completo
-2. Dirección exacta (con unidad/apartamento si aplica)
-3. Teléfono de contacto
-`.trim();
+INTENCIÓN DE COMPRA
+- Consideras que el cliente quiere comprar cuando dice cosas como:
+  "Lo quiero", "mándalo", "quiero pedir", "¿cómo hago el pedido?", "envíamelo a mi casa" y similares.
+- Si solo está preguntando o comparando, respondes de forma informativa sin pedir todavía datos personales.
 
-// ================== Redis helpers ==================
-const keyHistory = (waId) => `chat:wa:${waId}:history`;
-async function getHistory(waId) {
+FLUJO CUANDO QUIERE HACER PEDIDO
+Cuando detectes intención de compra, sigues este orden (adaptándolo al contexto):
+
+1) Confirmar el producto:
+   - Confirmas nombre del producto y presentación (tamaño, mililitros, kilos, etc.).
+   - Ejemplo: "¿Te confirmo entonces [nombre del producto] en presentación [tamaño]?"
+
+2) Confirmar cantidad:
+   - Preguntas cuántas unidades o bultos desea.
+   - Si ya lo dijo, solo validas.
+
+3) Preguntar si desea algo más:
+   - Pregunta suave, sin presión:
+     "¿Quieres agregar algo más para tu mascota o dejamos solo este producto?"
+
+4) Preguntar municipio y zona:
+   - Preguntas en qué municipio está (Rionegro, Marinilla, La Ceja, Guarne, Medellín, etc.).
+   - Luego preguntas barrio, edificio o sector para confirmar la cobertura del domicilio.
+
+5) Mostrar costo de domicilio:
+   - Usas la tabla de tarifas.
+   - Si el lugar no está, aclaras que por ahora no manejan envíos hacia ese destino.
+
+6) Mostrar resumen tipo recibo con total:
+   - Armas un resumen claro con productos, domicilio y total a pagar.
+
+7) Mostrar métodos de pago:
+   - Presentas las cuentas de pago de forma clara y fácil de copiar.
+
+8) Pedir comprobante:
+   - Pides la foto del comprobante de pago y aclaras que sin comprobante no se programa el despacho.
+
+DATOS PERSONALES
+- Solo pides datos personales cuando el cliente ya está en modo compra/domicilio.
+- Antes de despachar, necesitas:
+  - Nombre completo
+  - Número de celular
+  - Dirección exacta (calle, número, barrio o edificio, casa o apartamento)
+  - Municipio
+- Si la dirección es incompleta, preguntas con calma hasta que quede clara.
+- Validación de celular:
+  - Debe ser un número colombiano de 10 dígitos.
+  - Si parece incompleto, pides amablemente que lo confirme.
+
+PAGOS
+- Métodos de pago:
+  - Nequi: 0090610545
+  - Davivienda (BRE-B): @DAVIPERROTGATOTE
+- Siempre los muestras en líneas separadas para que el cliente pueda copiarlos fácilmente.
+- Por ejemplo:
+  "Métodos de pago:
+   - Nequi: 0090610545
+   - Davivienda (BRE-B): @DAVIPERROTGATOTE"
+- Siempre pides foto del comprobante de pago y explicas que sin comprobante no se puede programar el envío.
+
+RESUMEN TIPO RECIBO
+- Antes de dar el pedido por confirmado, siempre muestras un resumen tipo recibo con:
+  - Lista de productos, cada uno con cantidad, precio unitario y subtotal.
+  - Costo del domicilio.
+  - Total final a pagar.
+- Formato sugerido:
+  "Resumen de tu pedido:
+   1) [producto 1] · Cantidad: [x] · $[precio unitario] = $[subtotal]
+   2) [producto 2] · Cantidad: [y] · $[precio unitario] = $[subtotal]
+   Domicilio: $[valor domicilio]
+   Total a pagar: $[total final]"
+- Luego preguntas:
+  "¿Me confirmas si todo está correcto para continuar con el pago?"
+
+POSTVENTA
+- No haces campañas de seguimiento ni mensajes automáticos después de la compra.
+- Si el cliente escribe más adelante, lo atiendes normalmente.
+
+SALUD Y VETERINARIA
+- No das diagnósticos ni recomiendas tratamientos médicos específicos ni dosis.
+- Siempre recuerdas que en temas de salud lo mejor es que lo vea un veterinario.
+
+CONSEJOS Y ENTRENAMIENTO
+- Puedes dar consejos generales de comportamiento, socialización y entrenamiento básico.
+- Puedes relacionar esos consejos con productos de la tienda, sin presionar demasiado la venta.
+
+COMPORTAMIENTO GENERAL
+- No hablas de política, religión ni temas polémicos.
+- Si la conversación se va muy lejos del tema mascotas/compra, respondes breve y la vuelves a encaminar hacia ayudar a la mascota o al pedido.
+- Nunca dices que eres ChatGPT; siempre te presentas como el asesor virtual de Perrote y Gatote.
+`;
+
+// ============== HELPERS ==============
+
+// Buscar productos relevantes
+function findRelevantProducts(query, max = 6) {
+    if (!query || !fuse) return [];
+    const text = normalizeText(query || '');
+    if (!text || text.length < 2) return [];
     try {
-        const raw = await redis.get(keyHistory(waId));
-        return raw ? JSON.parse(raw) : [];
+        const results = fuse.search(text, { limit: max });
+        return results.map(r => r.item);
     } catch (e) {
-        if (DEBUG) console.error('[REDIS] getHistory:', e && e.message ? e.message : e);
+        console.error('[FUSE_ERROR]', e.message);
         return [];
     }
 }
 
-async function setHistory(waId, history) {
-    try {
-        const trimmed = history.slice(-HISTORY_MAX_MESSAGES);
-        await redis.set(keyHistory(waId), JSON.stringify(trimmed), 'EX', HISTORY_TTL_SECONDS);
-    } catch (e) {
-        if (DEBUG) console.error('[REDIS] setHistory:', e && e.message ? e.message : e);
-    }
-}
+// Construir mensajes para OpenAI
+function buildMessages({ history, userText, productContext }) {
+    const messages = [];
 
-// ================== OpenAI wrapper ==================
-function withTimeout(promise, ms) {
-    return new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('OPENAI_TIMEOUT')), ms);
-        promise
-            .then((v) => {
-                clearTimeout(t);
-                resolve(v);
-            })
-            .catch((e) => {
-                clearTimeout(t);
-                reject(e);
-            });
-    });
-}
+    messages.push({ role: 'system', content: systemPrompt });
 
-async function askOpenAI(messages) {
-    const maxTokens = OPENAI_MAX_TOKENS;
-    const temperature = 0.5;
-    if (DEBUG) {
-        console.log('[AI] mensajes enviados:', messages.length);
-    }
-
-    const resp = await withTimeout(
-        openai.chat.completions.create({
-            model: OPENAI_MODEL,
-            messages,
-            temperature,
-            max_tokens: maxTokens,
-        }),
-        OPENAI_TIMEOUT_MS
-    );
-    const choice = resp && resp.choices && resp.choices[0];
-    const text = choice && choice.message && choice.message.content ? String(choice.message.content).trim() : '';
-    if (!text) throw new Error('Respuesta vacía de OpenAI');
-    if (DEBUG) console.log('[AI] respuesta len=', text.length);
-    return text;
-}
-
-// ================== UltraMsg helpers ==================
-async function sendUltraText(waNumber, body) {
-    try {
-        if (!ULTRA_BASE_URL || !ULTRA_TOKEN) {
-            console.error('[ULTRA][SEND] Falta ULTRA_BASE_URL o ULTRA_TOKEN');
-            return;
-        }
-        if (!waNumber || !body) return;
-
-        const to = String(waNumber).replace(/[^\d]/g, '');
-        const params = new URLSearchParams();
-        params.append('token', ULTRA_TOKEN);
-        params.append('to', to);
-        params.append('body', body);
-        params.append('priority', '10');
-        const resp = await axios.post(
-            `${ULTRA_BASE_URL}/messages/chat`,
-            params.toString(), {
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                timeout: 20000,
-            }
+    if (productContext && productContext.length > 0) {
+        const ctx = JSON.stringify(
+            productContext.map(p => ({
+                id: p.id,
+                name: p.name,
+                price: p.price,
+                brand: p.brand,
+                category: p.category,
+            })),
+            null,
+            2
         );
-        if (DEBUG) console.log('[ULTRA][SEND] OK', resp.data);
-    } catch (e) {
-        console.error('[ULTRA][SEND] error:', e && e.message ? e.message : e);
-    }
-}
-
-// ================== Lógica de conversación ==================
-async function processConversation(userId, waNumber, userText) {
-    const history = await getHistory(userId);
-    // Comando de reset manual
-    if (/^\s*(reset|reiniciar|nuevo chat|nuevo pedido)\s*$/i.test(userText.trim())) {
-        await setHistory(userId, []);
-        return 'Listo, empezamos una conversación nueva. Cuéntame, ¿en qué te ayudo?';
-    }
-
-    const productContext = buildProductContext(userText);
-    const messages = [
-        { role: 'system', content: systemPrompt },
-    ];
-    if (productContext) {
         messages.push({
             role: 'system',
-            content: productContext,
+            content: 'Contexto de productos relevantes (no lo repitas literal, solo úsalo como referencia):\n' +
+                ctx,
         });
     }
 
-    // Añadimos historial previo
-    for (const m of history) {
-        messages.push(m);
+    if (Array.isArray(history)) {
+        for (const msg of history) {
+            if (!msg || !msg.role || !msg.content) continue;
+            messages.push({ role: msg.role, content: msg.content });
+        }
     }
 
-    // Mensaje actual del usuario
     messages.push({ role: 'user', content: userText });
 
-    let reply;
-    try {
-        reply = await askOpenAI(messages);
-    } catch (e) {
-        console.error('[AI] error:', e && e.message ? e.message : e);
-        reply = 'Se me presentó un problema técnico al responderte, pero ya estoy de nuevo aquí. ¿Me repites por favor lo que necesitas?';
-    }
-
-    // Actualizamos historial
-    const newHistory = [
-        ...history,
-        { role: 'user', content: userText },
-        { role: 'assistant', content: reply },
-    ];
-    await setHistory(userId, newHistory);
-
-    return reply;
+    return messages;
 }
 
-// ================== UltraMsg Webhook ==================
-async function handleUltraWebhook(req, res) {
+// Llamar a OpenAI
+async function callOpenAI(messages) {
+    const url = 'https://api.openai.com/v1/chat/completions';
+
+    const resp = await axios.post(
+        url, {
+            model: OPENAI_MODEL,
+            messages,
+            temperature: 0.6,
+            max_tokens: 600,
+        }, {
+            headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            timeout: 30000,
+        }
+    );
+
+    const choice = resp.data.choices && resp.data.choices[0];
+    const content =
+        choice && choice.message && choice.message.content ?
+        choice.message.content :
+        'Lo siento, tuve un problema para responder ahora.';
+    return content.trim();
+}
+
+// Extraer número y texto (ajusta esto a tu proveedor)
+function extractWhatsappPayload(reqBody) {
+    const body =
+        reqBody.Body ||
+        reqBody.body ||
+        reqBody.message ||
+        reqBody.text ||
+        '';
+
+    const from =
+        reqBody.waId ||
+        reqBody.waid ||
+        reqBody.from ||
+        reqBody.From ||
+        reqBody.sender ||
+        reqBody.phone ||
+        'desconocido';
+
+    return {
+        userWa: String(from),
+        rawBody: String(body || '').trim(),
+    };
+}
+
+// ============== RUTAS ==============
+
+app.get('/', (req, res) => {
+    res.send('Perrote y Gatote bot running 🐶🐱');
+});
+
+// Webhook principal
+app.post('/ultra-webhook', async(req, res) => {
     try {
-        if (DEBUG) {
-            console.log('[ULTRA][WEBHOOK] body =', JSON.stringify(req.body, null, 2));
+        const { userWa, rawBody } = extractWhatsappPayload(req.body || {});
+        console.log('[INCOMING]', userWa, rawBody);
+
+        if (!rawBody) {
+            return res.json({
+                reply: 'No alcancé a leer tu mensaje, ¿me lo repites por favor?',
+            });
         }
 
-        const eventType = req.body.event_type || req.body.eventType || '';
-        if (eventType && eventType !== 'message_received') {
-            return res.status(200).json({ ok: true, ignored: true });
+        // Comando para reiniciar conversación
+        if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
+            await resetSession(userWa);
+            return res.json({
+                reply: 'Listo, empecemos de nuevo 😊 Cuéntame qué necesita tu mascota o qué producto estás buscando.',
+            });
         }
 
-        const data = req.body.data || {};
-        const fromRaw = data.from || '';
-        const waNumber = String(fromRaw).split('@')[0];
+        // Cargar sesión
+        const session = (await getSession(userWa)) || { history: [] };
+        const history = Array.isArray(session.history) ? session.history : [];
 
-        let bodyText = data.body || '';
-        const type = data.type || 'chat';
-        if (!bodyText) {
-            if (type && type !== 'chat') {
-                bodyText = `[Mensaje de tipo ${type} recibido]`; // Simplificado
-                // Si es imagen, podrías detectar type === 'image' para agradecer el comprobante
-                if (type === 'image' || type === 'document') {
-                    bodyText = `[El cliente envió una imagen/documento (posible comprobante)]`;
-                }
-            } else {
-                console.error('[ULTRA][WEBHOOK] body vacío');
-                return res.status(200).json({ ok: false, reason: 'empty_body' });
+        // Buscar productos relevantes
+        const productContext = findRelevantProducts(rawBody, 6);
+
+        // Construir mensajes y llamar a OpenAI
+        const messages = buildMessages({
+            history,
+            userText: rawBody,
+            productContext,
+        });
+        const finalReply = await callOpenAI(messages);
+
+        // Actualizar historial
+        history.push({ role: 'user', content: rawBody });
+        history.push({ role: 'assistant', content: finalReply });
+        await saveSession(userWa, { history });
+
+        // Enviar a Telegram si parece resumen de pedido
+        if (finalReply.includes('Resumen de tu pedido')) {
+            try {
+                await sendOrderToTelegram({
+                    wa: userWa,
+                    text: finalReply,
+                });
+            } catch (err) {
+                console.error('[TELEGRAM_ERROR]', err.message);
             }
         }
 
-        if (!waNumber) {
-            console.error('[ULTRA][WEBHOOK] from vacío');
-            return res.status(200).json({ ok: false, reason: 'no_from' });
-        }
-
-        const userId = 'ultra:' + waNumber;
-        if (DEBUG) {
-            console.log('IN ULTRA >>', userId, '|', bodyText.slice(0, 140));
-        }
-
-        const finalReply = await processConversation(userId, waNumber, bodyText);
-
-        await sendUltraText(waNumber, finalReply);
-        if (DEBUG) {
-            console.log('OUT ULTRA << len =', finalReply.length);
-        }
-
-        return res.status(200).json({ ok: true });
-    } catch (e) {
-        console.error('[ULTRA] error en webhook:', e && e.message ? e.message : e);
-        return res.status(200).json({ ok: false });
-    }
-}
-
-// Ruta principal de UltraMsg
-app.post('/ultra-webhook', handleUltraWebhook);
-app.post('/', handleUltraWebhook);
-
-// ================== Health check ==================
-app.get('/health', async(req, res) => {
-    try {
-        const ping = await redis.ping();
+        return res.json({ reply: finalReply });
+    } catch (err) {
+        console.error('[WEBHOOK_ERROR]', err);
         return res.json({
-            ok: true,
-            time: new Date().toISOString(),
-            redis: ping === 'PONG',
-            model: OPENAI_MODEL,
+            reply: 'Tuve un problema técnico para responder ahora mismo 😔. Intenta escribir de nuevo en un momento, por favor.',
         });
-    } catch (e) {
-        return res.status(500).json({ ok: false, error: e && e.message ? e.message : e });
     }
 });
 
-// ================== Inicio ==================
+// ============== ARRANCAR SERVER ==============
 app.listen(PORT, () => {
     console.log(
-        'Server on http://localhost:' + PORT,
-        '| TZ=', TIMEZONE,
-        '| Model=', OPENAI_MODEL
+        `Server on http://localhost:${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
     );
-});
-
-// ================== Salida limpia ==================
-process.on('SIGINT', async() => {
-    try { await redis.quit(); } catch {}
-    console.log('[EXIT] SIGINT');
-    process.exit(0);
-});
-process.on('SIGTERM', async() => {
-    try { await redis.quit(); } catch {}
-    console.log('[EXIT] SIGTERM');
-    process.exit(0);
 });
