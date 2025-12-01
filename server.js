@@ -328,50 +328,48 @@ app.post('/ultra-webhook', async(req, res) => {
         console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
         console.log("========================================");
 
-        // 🔥 EXTRAER DATOS CORRECTAMENTE
+        // 🔥 Datos desde Ultramsg
         const body = req.body || {};
         const data = body.data || {};
+
         const rawBody = data.body || "";
         const userWa = (data.from || "").replace("@c.us", "");
 
-        // Si no hay texto → no procesar
         if (!rawBody.trim()) {
-            return res.json({
-                reply: "No alcancé a leer tu mensaje, ¿me lo repites por favor?"
-            });
+            return res.json({ reply: "¿Me repites tu mensaje por favor?" });
         }
 
-        // Comando para reiniciar
+        // RESET
         if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
             await resetSession(userWa);
             return res.json({
-                reply: "Listo, empecemos de nuevo 😊 ¿Qué necesita tu mascota hoy?"
+                reply: "Listo, empecemos de nuevo 😊 ¿Qué necesita tu mascota?"
             });
         }
 
-        // Cargar historial
+        // Sesión
         const session = (await getSession(userWa)) || { history: [] };
         const history = Array.isArray(session.history) ? session.history : [];
 
-        // Buscar productos según lo que el cliente escribió
+        // Productos
         const productContext = findRelevantProducts(rawBody, 6);
 
-        // Preparar mensaje para OpenAI
+        // Build mensajes
         const messages = buildMessages({
             history,
             userText: rawBody,
-            productContext,
+            productContext
         });
 
-        // Llamar a OpenAI
+        // 👉 Respuesta OpenAI
         const finalReply = await callOpenAI(messages);
 
         // Guardar historial
-        history.push({ role: "user", content: rawBody });
-        history.push({ role: "assistant", content: finalReply });
+        history.push({ role: 'user', content: rawBody });
+        history.push({ role: 'assistant', content: finalReply });
         await saveSession(userWa, { history });
 
-        // Enviar a Telegram si es un resumen de pedido
+        // Telegram si es resumen
         if (finalReply.includes("Resumen de tu pedido")) {
             try {
                 await sendOrderToTelegram({
@@ -379,17 +377,19 @@ app.post('/ultra-webhook', async(req, res) => {
                     text: finalReply
                 });
             } catch (err) {
-                console.error("[TELEGRAM_ERROR]", err.message);
+                console.error('[TELEGRAM_ERROR]', err.message);
             }
         }
 
-        // RESPUESTA DEL BOT
-        return res.json({ reply: finalReply });
+        // 🚨 RESPONDER *SIEMPRE*
+        return res.json({
+            reply: finalReply || "Estoy aquí, ¿en qué puedo ayudarte? 😊"
+        });
 
     } catch (err) {
-        console.error("[WEBHOOK_ERROR]", err);
+        console.error('[WEBHOOK_ERROR]', err);
         return res.json({
-            reply: "Tuve un problema técnico 😔 intenta nuevamente por favor."
+            reply: "Tuve un error técnico 😔 intenta de nuevo."
         });
     }
 });
