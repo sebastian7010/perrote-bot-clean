@@ -320,7 +320,13 @@ app.post('/ultra-webhook', async(req, res) => {
         console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
         console.log("========================================");
 
+        // Extraer datos del webhook UltraMsg
+        const body = req.body;
+        const data = body && body.data ? body.data : {};
+        const rawBody = data.body || "";
+        const userWa = (data.from || "").replace("@c.us", "");
 
+        // Si no hay texto
         if (!rawBody) {
             return res.json({
                 reply: 'No alcancé a leer tu mensaje, ¿me lo repites por favor?',
@@ -342,43 +348,39 @@ app.post('/ultra-webhook', async(req, res) => {
         // Buscar productos relevantes
         const productContext = findRelevantProducts(rawBody, 6);
 
-        // Construir mensajes y llamar a OpenAI
+        // Construir mensajes
         const messages = buildMessages({
             history,
             userText: rawBody,
-            productContext,
+            productContext
         });
+
+        // Llamar a OpenAI
         const finalReply = await callOpenAI(messages);
 
-        // Actualizar historial
-        history.push({ role: 'user', content: rawBody });
-        history.push({ role: 'assistant', content: finalReply });
+        // Guardar historial
+        history.push({ role: "user", content: rawBody });
+        history.push({ role: "assistant", content: finalReply });
         await saveSession(userWa, { history });
 
-        // Enviar a Telegram si parece resumen de pedido
-        if (finalReply.includes('Resumen de tu pedido')) {
+        // Enviar a Telegram si es resumen de compra
+        if (finalReply.includes("Resumen de tu pedido")) {
             try {
                 await sendOrderToTelegram({
                     wa: userWa,
-                    text: finalReply,
+                    text: finalReply
                 });
             } catch (err) {
-                console.error('[TELEGRAM_ERROR]', err.message);
+                console.error("[TELEGRAM_ERROR]", err.message);
             }
         }
 
         return res.json({ reply: finalReply });
+
     } catch (err) {
-        console.error('[WEBHOOK_ERROR]', err);
+        console.error("[WEBHOOK_ERROR]", err);
         return res.json({
-            reply: 'Tuve un problema técnico para responder ahora mismo 😔. Intenta escribir de nuevo en un momento, por favor.',
+            reply: "Tuve un problema técnico para responder 😔 Intenta escribirme de nuevo."
         });
     }
-});
-
-// ============== ARRANCAR SERVER ==============
-app.listen(PORT, () => {
-    console.log(
-        `Server on http://localhost:${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
-    );
 });
