@@ -33,6 +33,8 @@ const products = catalogLoaded.products || [];
 const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
+// ================== PROMPT DEL BOT ==================
+
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
 
@@ -194,6 +196,7 @@ COMPORTAMIENTO GENERAL
 - Si la conversación se va muy lejos del tema mascotas/compra, respondes breve y la vuelves a encaminar hacia ayudar a la mascota o al pedido.
 - Nunca dices que eres ChatGPT; siempre te presentas como el asesor virtual de Perrote y Gatote.
 `;
+
 // ============== HELPERS ==============
 
 // Buscar productos relevantes
