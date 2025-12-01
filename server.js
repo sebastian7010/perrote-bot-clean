@@ -286,29 +286,40 @@ async function callOpenAI(messages) {
 }
 
 // Extraer número y texto (ajusta esto a tu proveedor)
+
+
 function extractWhatsappPayload(reqBody) {
+    // Aseguramos un objeto
+    const wrapper = reqBody || {};
+
+    // UltraMsg envía todo dentro de "data"
+    const src = (wrapper.data && typeof wrapper.data === 'object') ?
+        wrapper.data :
+        wrapper;
+
+    // Texto del mensaje (distintos proveedores)
     const body =
-        reqBody.Body ||
-        reqBody.body ||
-        reqBody.message ||
-        reqBody.text ||
+        src.Body || // Twilio clásico
+        src.body || // Genérico
+        src.message || // Otros
+        src.text || // Otros
         '';
 
+    // Número/remitente (distintos proveedores)
     const from =
-        reqBody.waId ||
-        reqBody.waid ||
-        reqBody.from ||
-        reqBody.From ||
-        reqBody.sender ||
-        reqBody.phone ||
+        src.waId || // Meta WhatsApp Cloud
+        src.waid ||
+        src.from || // UltraMsg usa "from"
+        src.From ||
+        src.sender ||
+        src.phone ||
         'desconocido';
 
-    return {
-        userWa: String(from),
-        rawBody: String(body || '').trim(),
-    };
-}
+    const userWa = String(from);
+    const rawBody = String(body || '').trim();
 
+    return { userWa, rawBody };
+}
 // ============== RUTAS ==============
 
 app.get('/', (req, res) => {
@@ -326,70 +337,63 @@ app.post('/ultra-webhook', async(req, res) => {
         console.log("========== ULTRA WEBHOOK RAW ==========");
         console.log("HEADERS:", req.headers);
         console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
-        console.log("========================================");
+        console.log("=======================================");
 
-        // 🔥 Datos desde Ultramsg
-        const body = req.body || {};
-        const data = body.data || {};
+        // 👇 AQUÍ usamos la función que estaba en gris
+        const { userWa, rawBody } = extractWhatsappPayload(req.body);
+        console.log('>>> ULTRA PAYLOAD NORMALIZADO:', { userWa, rawBody });
 
-        const rawBody = data.body || "";
-        const userWa = (data.from || "").replace("@c.us", "");
-
-        if (!rawBody.trim()) {
-            return res.json({ reply: "¿Me repites tu mensaje por favor?" });
-        }
-
-        // RESET
-        if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
-            await resetSession(userWa);
+        // Si por alguna razón viene vacío
+        if (!rawBody) {
             return res.json({
-                reply: "Listo, empecemos de nuevo 😊 ¿Qué necesita tu mascota?"
+                reply: 'No alcancé a leer tu mensaje, ¿me lo repites por favor?',
             });
         }
 
-        // Sesión
+        // Comando para reiniciar conversación
+        if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
+            await resetSession(userWa);
+            return res.json({
+                reply: 'Listo, empecemos de nuevo 😊 Cuéntame qué necesita tu mascota o qué producto estás buscando.',
+            });
+        }
+
+        // Cargar sesión
         const session = (await getSession(userWa)) || { history: [] };
         const history = Array.isArray(session.history) ? session.history : [];
 
-        // Productos
+        // Buscar productos relevantes
         const productContext = findRelevantProducts(rawBody, 6);
 
-        // Build mensajes
+        // Construir mensajes y llamar a OpenAI
         const messages = buildMessages({
             history,
             userText: rawBody,
-            productContext
+            productContext,
         });
 
-        // 👉 Respuesta OpenAI
         const finalReply = await callOpenAI(messages);
 
-        // Guardar historial
+        // Actualizar historial
         history.push({ role: 'user', content: rawBody });
         history.push({ role: 'assistant', content: finalReply });
         await saveSession(userWa, { history });
 
-        // Telegram si es resumen
-        if (finalReply.includes("Resumen de tu pedido")) {
+        // Enviar a Telegram si parece resumen de pedido
+        if (finalReply.includes('Resumen de tu pedido')) {
             try {
-                await sendOrderToTelegram({
-                    wa: userWa,
-                    text: finalReply
-                });
+                await sendOrderToTelegram({ wa: userWa, text: finalReply });
             } catch (err) {
                 console.error('[TELEGRAM_ERROR]', err.message);
             }
         }
 
-        // 🚨 RESPONDER *SIEMPRE*
-        return res.json({
-            reply: finalReply || "Estoy aquí, ¿en qué puedo ayudarte? 😊"
-        });
-
+        // Respuesta para UltraMsg
+        return res.json({ reply: finalReply });
     } catch (err) {
         console.error('[WEBHOOK_ERROR]', err);
         return res.json({
-            reply: "Tuve un error técnico 😔 intenta de nuevo."
+            reply: 'Tuve un problema técnico para responder ahora mismo 😔. Intenta escribir de nuevo en un momento, por favor.',
         });
     }
 });
