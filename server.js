@@ -4,36 +4,28 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 
-const {
-    loadCatalog,
-    normalizeText,
-} = require('./lib/catalog');
-
+const { loadCatalog, normalizeText } = require('./lib/catalog');
 const { getSession, saveSession, resetSession } = require('./lib/session');
 const { sendOrderToTelegram } = require('./lib/telegram');
 
 process.env.TZ = process.env.TIMEZONE || 'America/Bogota';
 
+// Crear app de Express
 const app = express();
-// ============== ARRANCAR SERVER ==============
-const PORT = process.env.PORT;
-
-app.listen(PORT, () => {
-    console.log(
-        `Server on port ${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
-    );
-});
-
-
-// Config bot / OpenAI
-const BOT_NAME = process.env.BOT_NAME || 'Asesor Virtual';
-const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 // Middlewares
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// ================== CONFIG BOT / OPENAI ==================
+const BOT_NAME = process.env.BOT_NAME || 'Asesor Virtual';
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+// UltraMsg
+const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
+const ULTRA_API_TOKEN = process.env.ULTRA_API_TOKEN;
 
 // Cargar catálogo
 const catalogLoaded = loadCatalog();
@@ -41,7 +33,6 @@ const products = catalogLoaded.products || [];
 const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
-// ================== PROMPT DEL BOT ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
 
@@ -203,8 +194,6 @@ COMPORTAMIENTO GENERAL
 - Si la conversación se va muy lejos del tema mascotas/compra, respondes breve y la vuelves a encaminar hacia ayudar a la mascota o al pedido.
 - Nunca dices que eres ChatGPT; siempre te presentas como el asesor virtual de Perrote y Gatote.
 `;
-
-
 // ============== HELPERS ==============
 
 // Buscar productos relevantes
@@ -214,7 +203,7 @@ function findRelevantProducts(query, max = 6) {
     if (!text || text.length < 2) return [];
     try {
         const results = fuse.search(text, { limit: max });
-        return results.map(r => r.item);
+        return results.map((r) => r.item);
     } catch (e) {
         console.error('[FUSE_ERROR]', e.message);
         return [];
@@ -229,7 +218,7 @@ function buildMessages({ history, userText, productContext }) {
 
     if (productContext && productContext.length > 0) {
         const ctx = JSON.stringify(
-            productContext.map(p => ({
+            productContext.map((p) => ({
                 id: p.id,
                 name: p.name,
                 price: p.price,
@@ -285,32 +274,20 @@ async function callOpenAI(messages) {
     return content.trim();
 }
 
-// Extraer número y texto (ajusta esto a tu proveedor)
-
-
+// Extraer número y texto
 function extractWhatsappPayload(reqBody) {
-    // Aseguramos un objeto
     const wrapper = reqBody || {};
 
-    // UltraMsg envía todo dentro de "data"
-    const src = (wrapper.data && typeof wrapper.data === 'object') ?
-        wrapper.data :
-        wrapper;
+    const src =
+        wrapper.data && typeof wrapper.data === 'object' ? wrapper.data : wrapper;
 
-    // Texto del mensaje (distintos proveedores)
     const body =
-        src.Body || // Twilio clásico
-        src.body || // Genérico
-        src.message || // Otros
-        src.text || // Otros
-        '';
+        src.Body || src.body || src.message || src.text || '';
 
-    // Número/remitente (distintos proveedores)
     const from =
-        src.waId || // Meta WhatsApp Cloud
+        src.waId ||
         src.waid ||
-        src.from || // UltraMsg usa "from"
-        src.From ||
+        src.from ||
         src.sender ||
         src.phone ||
         'desconocido';
@@ -318,82 +295,148 @@ function extractWhatsappPayload(reqBody) {
     const userWa = String(from);
     const rawBody = String(body || '').trim();
 
-    return { userWa, rawBody };
+    return { userWa, rawBody, src };
 }
-// ============== RUTAS ==============
 
+// ============== "CEREBRO" DEL BOT ==============
+async function processConversation(userId, rawBody, media = []) {
+    // Cargar sesión
+    const session = (await getSession(userId)) || { history: [] };
+    const history = Array.isArray(session.history) ? session.history : [];
+
+    // Buscar productos relevantes
+    const productContext = findRelevantProducts(rawBody, 6);
+
+    // Construir mensajes y llamar a OpenAI
+    const messages = buildMessages({
+        history,
+        userText: rawBody,
+        productContext,
+    });
+    const finalReply = await callOpenAI(messages);
+
+    // Actualizar historial
+    history.push({ role: 'user', content: rawBody });
+    history.push({ role: 'assistant', content: finalReply });
+    await saveSession(userId, { history });
+
+    // Enviar a Telegram si parece resumen de pedido
+    if (finalReply.includes('Resumen de tu pedido')) {
+        try {
+            await sendOrderToTelegram({
+                wa: userId,
+                text: finalReply,
+                media,
+            });
+        } catch (err) {
+            console.error('[TELEGRAM_ERROR]', err.message);
+        }
+    }
+
+    return { finalReply };
+}
+
+// ============== ENVIAR MENSAJE POR ULTRAMSG ==============
+async function sendUltraText(phoneNumber, text) {
+    try {
+        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat`;
+        const payload = {
+            token: ULTRA_API_TOKEN,
+            to: phoneNumber,
+            body: text,
+            priority: 'high',
+        };
+
+        const resp = await axios.post(url, payload, { timeout: 15000 });
+        if (!resp.data || resp.data.sent !== true) {
+            console.error('[ULTRA][SEND] respuesta inesperada:', resp.data);
+        } else if (process.env.DEBUG) {
+            console.log('[ULTRA][SEND] OK', resp.data);
+        }
+    } catch (e) {
+        console.error('[ULTRA][SEND][ERROR]', e.message);
+    }
+}
+
+// ============== RUTAS BÁSICAS ==============
 app.get('/', (req, res) => {
     res.send('Perrote y Gatote bot running 🐶🐱');
 });
 
-// Health check para Render
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
 });
 
-// Webhook principal
-app.post('/ultra-webhook', async(req, res) => {
+// ============== WEBHOOK ULTRA ==============
+async function handleUltraWebhook(req, res) {
     try {
-        console.log("========== ULTRA WEBHOOK RAW ==========");
-        console.log("HEADERS:", req.headers);
-        console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
-        console.log("=======================================");
+        console.log('========== ULTRA WEBHOOK RAW ==========');
+        console.log('HEADERS:', req.headers);
+        console.log('BODY RAW:', JSON.stringify(req.body, null, 2));
+        console.log('========================================');
 
-        // 👇 AQUÍ usamos la función que estaba en gris
-        const { userWa, rawBody } = extractWhatsappPayload(req.body);
+        const { userWa, rawBody, src } = extractWhatsappPayload(req.body);
+
         console.log('>>> ULTRA PAYLOAD NORMALIZADO:', { userWa, rawBody });
 
-        // Si por alguna razón viene vacío
-        if (!rawBody) {
-            return res.json({
-                reply: 'No alcancé a leer tu mensaje, ¿me lo repites por favor?',
+        if (!userWa || !rawBody) {
+            console.error('[ULTRA] payload sin from/body');
+            return res.status(200).json({
+                ok: false,
+                reason: 'invalid_payload',
             });
         }
 
-        // Comando para reiniciar conversación
-        if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
-            await resetSession(userWa);
-            return res.json({
-                reply: 'Listo, empecemos de nuevo 😊 Cuéntame qué necesita tu mascota o qué producto estás buscando.',
-            });
+        const waNumber = userWa.replace(/@c\.us$/i, '');
+
+        const media = [];
+        if (src && src.media) {
+            media.push(src.media);
         }
 
-        // Cargar sesión
-        const session = (await getSession(userWa)) || { history: [] };
-        const history = Array.isArray(session.history) ? session.history : [];
+        const userId = 'ultra:' + waNumber;
 
-        // Buscar productos relevantes
-        const productContext = findRelevantProducts(rawBody, 6);
-
-        // Construir mensajes y llamar a OpenAI
-        const messages = buildMessages({
-            history,
-            userText: rawBody,
-            productContext,
-        });
-
-        const finalReply = await callOpenAI(messages);
-
-        // Actualizar historial
-        history.push({ role: 'user', content: rawBody });
-        history.push({ role: 'assistant', content: finalReply });
-        await saveSession(userWa, { history });
-
-        // Enviar a Telegram si parece resumen de pedido
-        if (finalReply.includes('Resumen de tu pedido')) {
-            try {
-                await sendOrderToTelegram({ wa: userWa, text: finalReply });
-            } catch (err) {
-                console.error('[TELEGRAM_ERROR]', err.message);
-            }
+        if (process.env.DEBUG) {
+            console.log(
+                'IN ULTRA >>',
+                userId,
+                '|',
+                (rawBody || '').slice(0, 140),
+                '... | media:',
+                media.length
+            );
         }
 
-        // Respuesta para UltraMsg
-        return res.json({ reply: finalReply });
+        const result = await processConversation(userId, rawBody, media);
+        const finalReply =
+            result && result.finalReply ?
+            result.finalReply :
+            '¡Gracias! Ya mismo te respondo por aquí.';
+
+        await sendUltraText(waNumber, finalReply);
+
+        if (process.env.DEBUG) {
+            console.log('OUT ULTRA << len =', finalReply.length);
+        }
+
+        return res.status(200).json({ ok: true });
     } catch (err) {
-        console.error('[WEBHOOK_ERROR]', err);
-        return res.json({
-            reply: 'Tuve un problema técnico para responder ahora mismo 😔. Intenta escribir de nuevo en un momento, por favor.',
+        console.error('[ULTRA][ERROR]', err);
+        return res.status(200).json({
+            ok: false,
+            error: err.message,
         });
     }
+}
+
+// Ruta que usa el handler (SOLO UNA VEZ)
+app.post('/ultra-webhook', handleUltraWebhook);
+
+// ============== ARRANCAR SERVER ==============
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+    console.log(
+        `Server on port ${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
+    );
 });
