@@ -25,7 +25,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // UltraMsg
 const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
-const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
+const ULTRA_API_TOKEN = process.env.ULTRA_API_TOKEN;
 
 // Cargar catálogo
 const catalogLoaded = loadCatalog();
@@ -34,7 +34,6 @@ const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
 // ================== PROMPT DEL BOT ==================
-
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
 
@@ -166,7 +165,11 @@ PAGOS
 - Nunca inventas otros números, bancos ni alias.
 
 RESUMEN TIPO RECIBO
-- Antes de dar el pedido por confirmado, siempre muestras un resumen tipo recibo con:
+- Antes de dar el pedido por confirmado, SIEMPRE debes mostrar un resumen tipo recibo.
+- Es OBLIGATORIO que el resumen comience con la línea EXACTA:
+  "Resumen de tu pedido:"
+  (sin emojis, sin cambios en las palabras, sin texto adicional en esa misma línea).
+- El resumen debe incluir:
   - Lista de productos, cada uno con cantidad, precio unitario y subtotal.
   - Costo del domicilio.
   - Total final a pagar.
@@ -176,6 +179,7 @@ RESUMEN TIPO RECIBO
    2) [producto 2] · Cantidad: [y] · $[precio unitario] = $[subtotal]
    Domicilio: $[valor domicilio]
    Total a pagar: $[total final]"
+
 - Luego preguntas:
   "¿Me confirmas si todo está correcto para continuar con el pago?"
 
@@ -284,8 +288,7 @@ function extractWhatsappPayload(reqBody) {
     const src =
         wrapper.data && typeof wrapper.data === 'object' ? wrapper.data : wrapper;
 
-    const body =
-        src.Body || src.body || src.message || src.text || '';
+    const body = src.Body || src.body || src.message || src.text || '';
 
     const from =
         src.waId ||
@@ -323,14 +326,19 @@ async function processConversation(userId, rawBody, media = []) {
     history.push({ role: 'assistant', content: finalReply });
     await saveSession(userId, { history });
 
+    // DEBUG: ver qué respondió
+    console.log('[[AI_REPLY]]', finalReply.slice(0, 300));
+
     // Enviar a Telegram si parece resumen de pedido
     if (finalReply.includes('Resumen de tu pedido')) {
+        console.log('[TELEGRAM] disparando envío de pedido...');
         try {
             await sendOrderToTelegram({
                 wa: userId,
                 text: finalReply,
                 media,
             });
+            console.log('[TELEGRAM] pedido enviado OK');
         } catch (err) {
             console.error('[TELEGRAM_ERROR]', err.message);
         }
@@ -338,16 +346,19 @@ async function processConversation(userId, rawBody, media = []) {
 
     return { finalReply };
 }
+
 // ============== ENVIAR MENSAJE POR ULTRAMSG ==============
 async function sendUltraText(phoneNumber, text) {
     try {
-        if (!ULTRA_INSTANCE_ID || !ULTRA_TOKEN) {
-            console.error('[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_TOKEN en el .env');
+        if (!ULTRA_INSTANCE_ID || !ULTRA_API_TOKEN) {
+            console.error(
+                '[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_API_TOKEN en el .env'
+            );
             return;
         }
 
         // El token va en la URL como parámetro GET
-        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_TOKEN}`;
+        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_API_TOKEN}`;
 
         const payload = {
             to: phoneNumber, // ej: 573108853158
@@ -366,15 +377,14 @@ async function sendUltraText(phoneNumber, text) {
             console.log('[ULTRA][SEND][RESP]', resp.data);
         }
 
-        // Ultra suele responder algo tipo { sent: true, ... }
-        if (!resp.data || resp.data.sent !== true) {
+        // Ultra suele responder algo tipo { sent: 'true', ... }
+        if (!resp.data || String(resp.data.sent) !== 'true') {
             console.error('[ULTRA][SEND] respuesta inesperada:', resp.data);
         }
     } catch (e) {
         console.error('[ULTRA][SEND][ERROR]', e.message);
     }
 }
-
 
 // ============== RUTAS BÁSICAS ==============
 app.get('/', (req, res) => {
@@ -384,6 +394,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
 });
+
 // ============== WEBHOOK ULTRA ==============
 async function handleUltraWebhook(req, res) {
     try {
@@ -450,7 +461,7 @@ async function handleUltraWebhook(req, res) {
 
         // Llamamos al "cerebro" del bot cuando hay texto
         const result = await processConversation(userId, rawBody, media);
-        const finalReply = (result && result.finalReply) ?
+        const finalReply = result && result.finalReply ?
             result.finalReply :
             '¡Gracias! Ya mismo te respondo por aquí.';
 
