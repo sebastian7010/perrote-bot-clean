@@ -338,28 +338,43 @@ async function processConversation(userId, rawBody, media = []) {
 
     return { finalReply };
 }
-
 // ============== ENVIAR MENSAJE POR ULTRAMSG ==============
 async function sendUltraText(phoneNumber, text) {
     try {
-        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat`;
+        if (!ULTRA_INSTANCE_ID || !ULTRA_API_TOKEN) {
+            console.error('[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_API_TOKEN en el .env');
+            return;
+        }
+
+        // El token va en la URL como parámetro GET
+        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_API_TOKEN}`;
+
         const payload = {
-            token: ULTRA_API_TOKEN,
-            to: phoneNumber,
+            to: phoneNumber, // ej: 573108853158
             body: text,
             priority: 'high',
         };
 
-        const resp = await axios.post(url, payload, { timeout: 15000 });
+        const resp = await axios.post(url, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            timeout: 15000,
+        });
+
+        if (process.env.DEBUG) {
+            console.log('[ULTRA][SEND][RESP]', resp.data);
+        }
+
+        // Ultra suele responder algo tipo { sent: true, ... }
         if (!resp.data || resp.data.sent !== true) {
             console.error('[ULTRA][SEND] respuesta inesperada:', resp.data);
-        } else if (process.env.DEBUG) {
-            console.log('[ULTRA][SEND] OK', resp.data);
         }
     } catch (e) {
         console.error('[ULTRA][SEND][ERROR]', e.message);
     }
 }
+
 
 // ============== RUTAS BÁSICAS ==============
 app.get('/', (req, res) => {
