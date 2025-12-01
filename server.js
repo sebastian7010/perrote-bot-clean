@@ -307,6 +307,11 @@ app.get('/', (req, res) => {
     res.send('Perrote y Gatote bot running 🐶🐱');
 });
 
+// Health check para Render
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+});
+
 // Webhook principal
 app.post('/ultra-webhook', async(req, res) => {
     try {
