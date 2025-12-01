@@ -315,8 +315,11 @@ app.get('/health', (req, res) => {
 // Webhook principal
 app.post('/ultra-webhook', async(req, res) => {
     try {
-        const { userWa, rawBody } = extractWhatsappPayload(req.body || {});
-        console.log('[INCOMING]', userWa, rawBody);
+        console.log("========== ULTRA WEBHOOK RAW ==========");
+        console.log("HEADERS:", req.headers);
+        console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
+        console.log("========================================");
+
 
         if (!rawBody) {
             return res.json({
