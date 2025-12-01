@@ -15,7 +15,15 @@ const { sendOrderToTelegram } = require('./lib/telegram');
 process.env.TZ = process.env.TIMEZONE || 'America/Bogota';
 
 const app = express();
-const PORT = process.env.PORT || 3008;
+// ============== ARRANCAR SERVER ==============
+const PORT = process.env.PORT;
+
+app.listen(PORT, () => {
+    console.log(
+        `Server on port ${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
+    );
+});
+
 
 // Config bot / OpenAI
 const BOT_NAME = process.env.BOT_NAME || 'Asesor Virtual';
