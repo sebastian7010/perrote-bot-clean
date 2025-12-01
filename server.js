@@ -328,14 +328,14 @@ app.post('/ultra-webhook', async(req, res) => {
         console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
         console.log("========================================");
 
-        // Extraer datos
+        // Extraer datos (esta parte DEBE estar arriba)
         const body = req.body;
         const data = body && body.data ? body.data : {};
         const rawBody = data.body || "";
         const userWa = (data.from || "").replace("@c.us", "");
 
-        // Si falta texto
-        if (!rawBody) {
+        // Validar texto
+        if (!rawBody.trim()) {
             return res.json({
                 reply: "No alcancé a leer tu mensaje, ¿me lo repites por favor?"
             });
@@ -383,7 +383,6 @@ app.post('/ultra-webhook', async(req, res) => {
             }
         }
 
-        // Respuesta final a UltraMsg
         return res.json({ reply: finalReply });
 
     } catch (err) {
