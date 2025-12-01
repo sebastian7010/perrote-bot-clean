@@ -328,24 +328,24 @@ app.post('/ultra-webhook', async(req, res) => {
         console.log("BODY RAW:", JSON.stringify(req.body, null, 2));
         console.log("========================================");
 
-        // Extraer datos (esta parte DEBE estar arriba)
-        const body = req.body;
-        const data = body && body.data ? body.data : {};
+        // 🔥 EXTRAER DATOS CORRECTAMENTE
+        const body = req.body || {};
+        const data = body.data || {};
         const rawBody = data.body || "";
         const userWa = (data.from || "").replace("@c.us", "");
 
-        // Validar texto
+        // Si no hay texto → no procesar
         if (!rawBody.trim()) {
             return res.json({
                 reply: "No alcancé a leer tu mensaje, ¿me lo repites por favor?"
             });
         }
 
-        // Reset
+        // Comando para reiniciar
         if (/^(reset|reiniciar|borrar chat)$/i.test(rawBody.trim())) {
             await resetSession(userWa);
             return res.json({
-                reply: "Listo, empecemos de nuevo 😊 Cuéntame qué necesita tu mascota."
+                reply: "Listo, empecemos de nuevo 😊 ¿Qué necesita tu mascota hoy?"
             });
         }
 
@@ -353,10 +353,10 @@ app.post('/ultra-webhook', async(req, res) => {
         const session = (await getSession(userWa)) || { history: [] };
         const history = Array.isArray(session.history) ? session.history : [];
 
-        // Buscar productos
+        // Buscar productos según lo que el cliente escribió
         const productContext = findRelevantProducts(rawBody, 6);
 
-        // Construir mensajes
+        // Preparar mensaje para OpenAI
         const messages = buildMessages({
             history,
             userText: rawBody,
@@ -371,24 +371,25 @@ app.post('/ultra-webhook', async(req, res) => {
         history.push({ role: "assistant", content: finalReply });
         await saveSession(userWa, { history });
 
-        // Notificar a Telegram si es resumen de pedido
+        // Enviar a Telegram si es un resumen de pedido
         if (finalReply.includes("Resumen de tu pedido")) {
             try {
                 await sendOrderToTelegram({
                     wa: userWa,
-                    text: finalReply,
+                    text: finalReply
                 });
             } catch (err) {
                 console.error("[TELEGRAM_ERROR]", err.message);
             }
         }
 
+        // RESPUESTA DEL BOT
         return res.json({ reply: finalReply });
 
     } catch (err) {
         console.error("[WEBHOOK_ERROR]", err);
         return res.json({
-            reply: "Tuve un problema técnico para responder 😔. Intenta escribir de nuevo por favor."
+            reply: "Tuve un problema técnico 😔 intenta nuevamente por favor."
         });
     }
 });
