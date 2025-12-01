@@ -24,7 +24,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // UltraMsg
-const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
+const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
 const ULTRA_API_TOKEN = process.env.ULTRA_API_TOKEN;
 
 // Cargar catálogo
@@ -350,15 +350,15 @@ async function processConversation(userId, rawBody, media = []) {
 // ============== ENVIAR MENSAJE POR ULTRAMSG ==============
 async function sendUltraText(phoneNumber, text) {
     try {
-        if (!ULTRA_INSTANCE_ID || !ULTRA_API_TOKEN) {
+        if (!ULTRA_TOKEN || !ULTRA_TOKEN) {
             console.error(
-                '[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_API_TOKEN en el .env'
+                '[ULTRA][SEND][ERROR] Faltan ULTRA_TOKEN o ULTRA_API_TOKEN en el .env'
             );
             return;
         }
 
         // El token va en la URL como parámetro GET
-        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_API_TOKEN}`;
+        const url = `https://api.ultramsg.com/${ULTRA_TOKEN}/messages/chat?token=${ULTRA_API_TOKEN}`;
 
         const payload = {
             to: phoneNumber, // ej: 573108853158
