@@ -384,7 +384,6 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
 });
-
 // ============== WEBHOOK ULTRA ==============
 async function handleUltraWebhook(req, res) {
     try {
@@ -393,22 +392,37 @@ async function handleUltraWebhook(req, res) {
         console.log('BODY RAW:', JSON.stringify(req.body, null, 2));
         console.log('========================================');
 
+        // Normalizamos payload (sirve para Ultra y otros)
         const { userWa, rawBody, src } = extractWhatsappPayload(req.body);
 
         console.log('>>> ULTRA PAYLOAD NORMALIZADO:', { userWa, rawBody });
 
-        if (!userWa || !rawBody) {
-            console.error('[ULTRA] payload sin from/body');
+        // Si no hay remitente, no podemos responder
+        if (!userWa) {
+            console.error('[ULTRA] payload sin from');
             return res.status(200).json({
                 ok: false,
-                reason: 'invalid_payload',
+                reason: 'missing_from',
             });
         }
 
+        const hasMedia = !!(src && src.media);
+
+        // Si no hay texto ni media, no hacemos nada
+        if (!rawBody && !hasMedia) {
+            console.error('[ULTRA] payload sin body ni media');
+            return res.status(200).json({
+                ok: false,
+                reason: 'empty_message',
+            });
+        }
+
+        // Ultra envía "57310...@c.us" → quitamos el sufijo
         const waNumber = userWa.replace(/@c\.us$/i, '');
 
+        // Media (si viene una imagen o similar)
         const media = [];
-        if (src && src.media) {
+        if (hasMedia) {
             media.push(src.media);
         }
 
@@ -425,18 +439,29 @@ async function handleUltraWebhook(req, res) {
             );
         }
 
+        // Si NO hay texto pero sí hay imagen → respuesta básica
+        if (!rawBody && hasMedia) {
+            const msg =
+                '🐶🐱 He recibido la foto que enviaste.\n' +
+                'Cuéntame por favor qué producto necesitas o qué quieres para tu mascota y te ayudo a armar el pedido.';
+            await sendUltraText(waNumber, msg);
+            return res.status(200).json({ ok: true });
+        }
+
+        // Llamamos al "cerebro" del bot cuando hay texto
         const result = await processConversation(userId, rawBody, media);
-        const finalReply =
-            result && result.finalReply ?
+        const finalReply = (result && result.finalReply) ?
             result.finalReply :
             '¡Gracias! Ya mismo te respondo por aquí.';
 
+        // Enviar la respuesta al usuario por UltraMsg
         await sendUltraText(waNumber, finalReply);
 
         if (process.env.DEBUG) {
             console.log('OUT ULTRA << len =', finalReply.length);
         }
 
+        // A UltraMsg solo le devolvemos OK
         return res.status(200).json({ ok: true });
     } catch (err) {
         console.error('[ULTRA][ERROR]', err);
@@ -447,7 +472,7 @@ async function handleUltraWebhook(req, res) {
     }
 }
 
-// Ruta que usa el handler (SOLO UNA VEZ)
+// Ruta que usa el handler de UltraMsg
 app.post('/ultra-webhook', handleUltraWebhook);
 
 // ============== ARRANCAR SERVER ==============
