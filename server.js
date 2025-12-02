@@ -23,7 +23,7 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-// UltraMsg (OJO con estos nombres en Render)
+// UltraMsg
 const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
 const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
 
@@ -33,7 +33,6 @@ const products = catalogLoaded.products || [];
 const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
-// ================== PROMPT DEL BOT ==================
 // ================== PROMPT DEL BOT ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
@@ -201,10 +200,8 @@ COMPORTAMIENTO GENERAL
 - Si la conversación se va muy lejos del tema mascotas/compra, respondes breve y la vuelves a encaminar hacia ayudar a la mascota o al pedido.
 - Nunca dices que eres ChatGPT; siempre te presentas como el asesor virtual de Perrote y Gatote.
 `;
-
 // ============== HELPERS ==============
 
-// Buscar productos relevantes
 function findRelevantProducts(query, max = 6) {
     if (!query || !fuse) return [];
     const text = normalizeText(query || '');
@@ -218,7 +215,6 @@ function findRelevantProducts(query, max = 6) {
     }
 }
 
-// Construir mensajes para OpenAI
 function buildMessages({ history, userText, productContext }) {
     const messages = [];
 
@@ -255,7 +251,6 @@ function buildMessages({ history, userText, productContext }) {
     return messages;
 }
 
-// Llamar a OpenAI
 async function callOpenAI(messages) {
     const url = 'https://api.openai.com/v1/chat/completions';
 
@@ -282,7 +277,6 @@ async function callOpenAI(messages) {
     return content.trim();
 }
 
-// Extraer número y texto
 function extractWhatsappPayload(reqBody) {
     const wrapper = reqBody || {};
     const src =
@@ -318,7 +312,13 @@ async function processConversation(userId, rawBody, media = []) {
 
     console.log('[[AI_REPLY]]', finalReply.slice(0, 300));
 
-    if (finalReply.includes('Resumen de tu pedido')) {
+    const shouldSendToTelegram =
+        finalReply.includes('Resumen de tu pedido') ||
+        finalReply.includes('Total a pagar') ||
+        finalReply.includes('💳 Opciones de pago') ||
+        finalReply.includes('foto del comprobante de pago');
+
+    if (shouldSendToTelegram) {
         console.log('[TELEGRAM] disparando envío de pedido...');
         try {
             await sendOrderToTelegram({
@@ -360,7 +360,6 @@ async function sendUltraText(phoneNumber, text) {
             timeout: 15000,
         });
 
-        // Ultra responde { sent: 'true', ... } (string)
         if (process.env.DEBUG) {
             console.log('[ULTRA][SEND][RESP]', resp.data);
         }
@@ -463,9 +462,26 @@ async function handleUltraWebhook(req, res) {
 
 app.post('/ultra-webhook', handleUltraWebhook);
 
+// ============== TEST TELEGRAM ==============
+app.get('/test-telegram', async(req, res) => {
+    try {
+        await sendOrderToTelegram({
+            wa: 'ultra:TEST',
+            text: 'Resumen de tu pedido:\n' +
+                '1) Prueba · Cantidad: 1 · $10.000 = $10.000\n' +
+                'Domicilio: $9.000\n' +
+                'Total a pagar: $19.000',
+            media: [],
+        });
+        res.send('Telegram OK');
+    } catch (err) {
+        console.error('[TELEGRAM_TEST_ERROR]', err.message);
+        res.status(500).send('Error enviando a Telegram');
+    }
+});
+
 // ============== ARRANCAR SERVER ==============
 const PORT = process.env.PORT || 10000;
-
 app.listen(PORT, () => {
     console.log(
         `Server on port ${PORT} | TZ=${process.env.TZ} | MODEL=${OPENAI_MODEL} | items=${products.length}`
