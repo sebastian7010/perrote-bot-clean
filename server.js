@@ -410,6 +410,25 @@ app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
 });
 
+
+
+// Ruta de prueba para Telegram
+app.get('/test-telegram', async(req, res) => {
+    try {
+        await sendOrderToTelegram({
+            wa: 'ultra:TEST',
+            text: '🐶 Prueba desde /test-telegram en Render',
+            media: [],
+        });
+
+        res.status(200).send('OK: mensaje enviado a Telegram');
+    } catch (e) {
+        console.error('[TELEGRAM][TEST_ERROR]', e.message);
+        res.status(500).send('Error enviando a Telegram: ' + e.message);
+    }
+});
+
+
 // ============== WEBHOOK ULTRA ==============
 async function handleUltraWebhook(req, res) {
     try {
