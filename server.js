@@ -374,6 +374,34 @@ async function sendUltraText(phoneNumber, text) {
 }
 
 // ============== RUTAS BÁSICAS ==============
+
+
+// 🔧 Ruta de prueba para Telegram
+app.get('/test-telegram', async(req, res) => {
+    try {
+        await sendOrderToTelegram({
+            wa: 'TEST::curl',
+            text: '🐶 Pedido de prueba desde /test-telegram en Render',
+            media: [
+                'https://dq5j9legq19ov.cloudfront.net/imagenes-webp/agility-gold-pequenos-adultos-x-3-kilos.webp',
+            ],
+        });
+
+        return res.json({
+            ok: true,
+            message: 'Mensaje de prueba enviado a Telegram',
+        });
+    } catch (err) {
+        console.error('[TEST_TELEGRAM_ERROR]', err.message);
+        return res.status(500).json({
+            ok: false,
+            error: err.message,
+        });
+    }
+});
+
+
+
 app.get('/', (req, res) => {
     res.send('Perrote y Gatote bot running 🐶🐱');
 });
