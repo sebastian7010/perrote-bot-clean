@@ -23,9 +23,9 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-// UltraMsg (OJO con estos nombres en Render)
-const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
+// UltraMsg
 const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
+const ULTRA_API_TOKEN = process.env.ULTRA_API_TOKEN;
 
 // Cargar catálogo
 const catalogLoaded = loadCatalog();
@@ -33,7 +33,6 @@ const products = catalogLoaded.products || [];
 const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
-// ================== PROMPT DEL BOT ==================
 // ================== PROMPT DEL BOT ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
@@ -285,12 +284,19 @@ async function callOpenAI(messages) {
 // Extraer número y texto
 function extractWhatsappPayload(reqBody) {
     const wrapper = reqBody || {};
+
     const src =
         wrapper.data && typeof wrapper.data === 'object' ? wrapper.data : wrapper;
 
     const body = src.Body || src.body || src.message || src.text || '';
+
     const from =
-        src.waId || src.waid || src.from || src.sender || src.phone || 'desconocido';
+        src.waId ||
+        src.waid ||
+        src.from ||
+        src.sender ||
+        src.phone ||
+        'desconocido';
 
     const userWa = String(from);
     const rawBody = String(body || '').trim();
@@ -300,11 +306,14 @@ function extractWhatsappPayload(reqBody) {
 
 // ============== "CEREBRO" DEL BOT ==============
 async function processConversation(userId, rawBody, media = []) {
+    // Cargar sesión
     const session = (await getSession(userId)) || { history: [] };
     const history = Array.isArray(session.history) ? session.history : [];
 
+    // Buscar productos relevantes
     const productContext = findRelevantProducts(rawBody, 6);
 
+    // Construir mensajes y llamar a OpenAI
     const messages = buildMessages({
         history,
         userText: rawBody,
@@ -312,12 +321,15 @@ async function processConversation(userId, rawBody, media = []) {
     });
     const finalReply = await callOpenAI(messages);
 
+    // Actualizar historial
     history.push({ role: 'user', content: rawBody });
     history.push({ role: 'assistant', content: finalReply });
     await saveSession(userId, { history });
 
+    // DEBUG: ver qué respondió
     console.log('[[AI_REPLY]]', finalReply.slice(0, 300));
 
+    // Enviar a Telegram si parece resumen de pedido
     if (finalReply.includes('Resumen de tu pedido')) {
         console.log('[TELEGRAM] disparando envío de pedido...');
         try {
@@ -338,17 +350,18 @@ async function processConversation(userId, rawBody, media = []) {
 // ============== ENVIAR MENSAJE POR ULTRAMSG ==============
 async function sendUltraText(phoneNumber, text) {
     try {
-        if (!ULTRA_INSTANCE_ID || !ULTRA_TOKEN) {
+        if (!ULTRA_TOKEN || !ULTRA_TOKEN) {
             console.error(
-                '[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_TOKEN en el .env'
+                '[ULTRA][SEND][ERROR] Faltan ULTRA_TOKEN o ULTRA_API_TOKEN en el .env'
             );
             return;
         }
 
-        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_TOKEN}`;
+        // El token va en la URL como parámetro GET
+        const url = `https://api.ultramsg.com/${ULTRA_TOKEN}/messages/chat?token=${ULTRA_API_TOKEN}`;
 
         const payload = {
-            to: phoneNumber,
+            to: phoneNumber, // ej: 573108853158
             body: text,
             priority: 'high',
         };
@@ -360,13 +373,12 @@ async function sendUltraText(phoneNumber, text) {
             timeout: 15000,
         });
 
-        // Ultra responde { sent: 'true', ... } (string)
         if (process.env.DEBUG) {
             console.log('[ULTRA][SEND][RESP]', resp.data);
         }
 
-        const sentValue = resp.data && resp.data.sent;
-        if (sentValue !== true && sentValue !== 'true') {
+        // Ultra suele responder algo tipo { sent: 'true', ... }
+        if (!resp.data || String(resp.data.sent) !== 'true') {
             console.error('[ULTRA][SEND] respuesta inesperada:', resp.data);
         }
     } catch (e) {
@@ -391,9 +403,12 @@ async function handleUltraWebhook(req, res) {
         console.log('BODY RAW:', JSON.stringify(req.body, null, 2));
         console.log('========================================');
 
+        // Normalizamos payload (sirve para Ultra y otros)
         const { userWa, rawBody, src } = extractWhatsappPayload(req.body);
+
         console.log('>>> ULTRA PAYLOAD NORMALIZADO:', { userWa, rawBody });
 
+        // Si no hay remitente, no podemos responder
         if (!userWa) {
             console.error('[ULTRA] payload sin from');
             return res.status(200).json({
@@ -404,6 +419,7 @@ async function handleUltraWebhook(req, res) {
 
         const hasMedia = !!(src && src.media);
 
+        // Si no hay texto ni media, no hacemos nada
         if (!rawBody && !hasMedia) {
             console.error('[ULTRA] payload sin body ni media');
             return res.status(200).json({
@@ -412,8 +428,10 @@ async function handleUltraWebhook(req, res) {
             });
         }
 
+        // Ultra envía "57310...@c.us" → quitamos el sufijo
         const waNumber = userWa.replace(/@c\.us$/i, '');
 
+        // Media (si viene una imagen o similar)
         const media = [];
         if (hasMedia) {
             media.push(src.media);
@@ -432,6 +450,7 @@ async function handleUltraWebhook(req, res) {
             );
         }
 
+        // Si NO hay texto pero sí hay imagen → respuesta básica
         if (!rawBody && hasMedia) {
             const msg =
                 '🐶🐱 He recibido la foto que enviaste.\n' +
@@ -440,17 +459,20 @@ async function handleUltraWebhook(req, res) {
             return res.status(200).json({ ok: true });
         }
 
+        // Llamamos al "cerebro" del bot cuando hay texto
         const result = await processConversation(userId, rawBody, media);
-        const finalReply =
-            (result && result.finalReply) ||
+        const finalReply = result && result.finalReply ?
+            result.finalReply :
             '¡Gracias! Ya mismo te respondo por aquí.';
 
+        // Enviar la respuesta al usuario por UltraMsg
         await sendUltraText(waNumber, finalReply);
 
         if (process.env.DEBUG) {
             console.log('OUT ULTRA << len =', finalReply.length);
         }
 
+        // A UltraMsg solo le devolvemos OK
         return res.status(200).json({ ok: true });
     } catch (err) {
         console.error('[ULTRA][ERROR]', err);
@@ -461,6 +483,7 @@ async function handleUltraWebhook(req, res) {
     }
 }
 
+// Ruta que usa el handler de UltraMsg
 app.post('/ultra-webhook', handleUltraWebhook);
 
 // ============== ARRANCAR SERVER ==============
