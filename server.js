@@ -23,9 +23,15 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'Perrote y Gatote';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-// UltraMsg (OJO con estos nombres en Render)
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '30000', 10);
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || '600', 10);
+const OPENAI_MAX_ATTEMPTS = parseInt(process.env.OPENAI_MAX_ATTEMPTS || '1', 10);
+const HISTORY_MAX_TURNS = parseInt(process.env.HISTORY_MAX_TURNS || '12', 10);
+
+// UltraMsg (ajustado a tu .env)
 const ULTRA_INSTANCE_ID = process.env.ULTRA_INSTANCE_ID;
 const ULTRA_TOKEN = process.env.ULTRA_TOKEN;
+const ULTRA_BASE_URL = process.env.ULTRA_BASE_URL || '';
 
 // Cargar catálogo
 const catalogLoaded = loadCatalog();
@@ -33,7 +39,6 @@ const products = catalogLoaded.products || [];
 const fuse = catalogLoaded.fuse || null;
 console.log('[CATALOG] items:', products.length);
 
-// ================== PROMPT DEL BOT ==================
 // ================== PROMPT DEL BOT ==================
 const systemPrompt = `
 Eres ${BOT_NAME}, el asesor virtual de ventas de la tienda de mascotas "${COMPANY_NAME}" en Rionegro, Antioquia (Colombia).
@@ -120,7 +125,7 @@ Cuando detectes intención de compra, sigues este orden (adaptándolo al context
 
 5) Mostrar costo de domicilio:
    - Usas la tabla de tarifas.
-   - Si el lugar no está, aclaras que por ahora no manejan envíos hacia ese destino.
+   - Si el lugar no está, aclaras que por ahora solo manejan envíos hacia ese destino.
 
 6) Mostrar resumen tipo recibo con total:
    - Armas un resumen claro con productos, domicilio y total a pagar.
@@ -200,11 +205,21 @@ COMPORTAMIENTO GENERAL
 - No hablas de política, religión ni temas polémicos.
 - Si la conversación se va muy lejos del tema mascotas/compra, respondes breve y la vuelves a encaminar hacia ayudar a la mascota o al pedido.
 - Nunca dices que eres ChatGPT; siempre te presentas como el asesor virtual de Perrote y Gatote.
+- Si el cliente te pregunta directamente si eres una IA, un robot o algo parecido, respondes con transparencia que sí eres una inteligencia artificial creada por un equipo de desarrolladores para Perrote y Gatote y que, si prefiere hablar con una persona, puede escribir al 3108853158 por WhatsApp.
+
+CASOS ESPECIALES: MENSAJES DESDE LA PÁGINA WEB
+- A veces recibirás mensajes que empiezan con frases como "Hola, estoy interesado en comprar los siguientes productos:" y luego una lista donde cada producto viene con nombre, cantidad, precio unitario, subtotal, imagen y un "Total a pagar".
+- En esos casos asumes que el cliente ya armó su pedido en la página y:
+  1) Confirmas el listado de productos sin cambiar precios ni cantidades.
+  2) Pides los datos de envío (nombre, celular, dirección exacta y municipio).
+  3) Calculas y comunicas el valor del domicilio usando la tabla de tarifas de envíos.
+  4) Muestras el resumen tipo recibo con productos + domicilio + total final.
+  5) Muestras las opciones de pago y pides la foto del comprobante para programar el despacho.
 `;
 
 // ============== HELPERS ==============
 
-// Buscar productos relevantes
+// Buscar productos relevantes usando Fuse (soporta marcas, categorías, errores de tipeo, etc.)
 function findRelevantProducts(query, max = 6) {
     if (!query || !fuse) return [];
     const text = normalizeText(query || '');
@@ -255,42 +270,118 @@ function buildMessages({ history, userText, productContext }) {
     return messages;
 }
 
-// Llamar a OpenAI
+// Detectar si el cliente está preguntando si eres una IA
+function isAiQuestion(text) {
+    const t = normalizeText(text || '');
+    if (!t) return false;
+    return (
+        t.includes('eres una ia') ||
+        t.includes('eres ia') ||
+        t.includes('eres inteligencia artificial') ||
+        t.includes('eres un robot') ||
+        t.includes('eres robot') ||
+        t.includes('eres un bot') ||
+        t.includes('tu eres ia') ||
+        t.includes('tú eres ia') ||
+        t.includes('eres una inteligencia artificial')
+    );
+}
+
+// Construir nota interna para Telegram sobre la compra/conversación
+function buildAdminNote(userId, rawBody, finalReply) {
+    const lines = [];
+    lines.push('----- NOTA INTERNA PARA SEBASTIÁN (NO SE ENVÍA AL CLIENTE) -----');
+    lines.push(`ID conversación: ${userId}`);
+
+    let estado =
+        'Estado estimado: conversación general, sin pedido confirmado todavía.';
+    if (finalReply.includes('Resumen de tu pedido')) {
+        estado =
+            'Estado estimado: pedido armado, se envió resumen con total y métodos de pago. Probablemente falta recibir comprobante de pago.';
+    } else if (finalReply.includes('💳 Opciones de pago')) {
+        estado =
+            'Estado estimado: el bot ya compartió métodos de pago, cliente en fase de pago.';
+    } else if (/municipio|domicilio|direcci[oó]n|barrio/i.test(finalReply)) {
+        estado =
+            'Estado estimado: el bot está pidiendo o confirmando datos de envío.';
+    }
+
+    lines.push(estado);
+    lines.push('');
+
+    if (rawBody) {
+        lines.push('Último mensaje del cliente (recortado):');
+        lines.push(rawBody.slice(0, 500));
+        lines.push('');
+    }
+
+    lines.push('Respuesta enviada al cliente (recortada si es muy larga):');
+    lines.push(finalReply.slice(0, 1200));
+
+    return lines.join('\n');
+}
+
+// Llamar a OpenAI con reintentos y usando tus variables de entorno
 async function callOpenAI(messages) {
     const url = 'https://api.openai.com/v1/chat/completions';
 
-    const resp = await axios.post(
-        url, {
-            model: OPENAI_MODEL,
-            messages,
-            temperature: 0.6,
-            max_tokens: 600,
-        }, {
-            headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                'Content-Type': 'application/json',
-            },
-            timeout: 30000,
-        }
-    );
+    const maxAttempts = OPENAI_MAX_ATTEMPTS > 0 ? OPENAI_MAX_ATTEMPTS : 1;
+    let lastError = null;
 
-    const choice = resp.data.choices && resp.data.choices[0];
-    const content =
-        choice && choice.message && choice.message.content ?
-        choice.message.content :
-        'Lo siento, tuve un problema para responder ahora.';
-    return content.trim();
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const resp = await axios.post(
+                url, {
+                    model: OPENAI_MODEL,
+                    messages,
+                    temperature: 0.6,
+                    max_tokens: OPENAI_MAX_TOKENS,
+                }, {
+                    headers: {
+                        Authorization: `Bearer ${OPENAI_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: OPENAI_TIMEOUT_MS,
+                }
+            );
+
+            const choice = resp.data.choices && resp.data.choices[0];
+            const content =
+                choice && choice.message && choice.message.content ?
+                choice.message.content :
+                'Lo siento, tuve un problema para responder ahora.';
+            return content.trim();
+        } catch (err) {
+            lastError = err;
+            console.error(
+                `[OPENAI][ERROR] intento ${attempt}/${maxAttempts}:`,
+                err.message
+            );
+            if (attempt === maxAttempts) {
+                break;
+            }
+        }
+    }
+
+    return 'Lo siento, tuve un problema para responder ahora.';
 }
 
-// Extraer número y texto
+// Extraer número y texto (normalizador para distintos proveedores)
 function extractWhatsappPayload(reqBody) {
     const wrapper = reqBody || {};
+
     const src =
         wrapper.data && typeof wrapper.data === 'object' ? wrapper.data : wrapper;
 
     const body = src.Body || src.body || src.message || src.text || '';
+
     const from =
-        src.waId || src.waid || src.from || src.sender || src.phone || 'desconocido';
+        src.waId ||
+        src.waid ||
+        src.from ||
+        src.sender ||
+        src.phone ||
+        'desconocido';
 
     const userWa = String(from);
     const rawBody = String(body || '').trim();
@@ -300,11 +391,32 @@ function extractWhatsappPayload(reqBody) {
 
 // ============== "CEREBRO" DEL BOT ==============
 async function processConversation(userId, rawBody, media = []) {
+    // Cargar sesión
     const session = (await getSession(userId)) || { history: [] };
     const history = Array.isArray(session.history) ? session.history : [];
 
+    // Si el usuario pregunta si eres una IA, respondemos fijo sin llamar a OpenAI
+    if (isAiQuestion(rawBody)) {
+        const aiReply =
+            'Sí, soy una inteligencia artificial desarrollada por un equipo de desarrolladores para ayudarte con tus pedidos en Perrote y Gatote 🐶🐱. ' +
+            'Si prefieres hablar con una persona, puedes escribir o llamar al 3108853158 por WhatsApp.';
+
+        history.push({ role: 'user', content: rawBody });
+        history.push({ role: 'assistant', content: aiReply });
+        await saveSession(userId, { history });
+
+        return { finalReply: aiReply };
+    }
+
+    // Recortar historial según HISTORY_MAX_TURNS (pares usuario/asistente)
+    if (HISTORY_MAX_TURNS > 0 && history.length > HISTORY_MAX_TURNS * 2) {
+        history.splice(0, history.length - HISTORY_MAX_TURNS * 2);
+    }
+
+    // Buscar productos relevantes
     const productContext = findRelevantProducts(rawBody, 6);
 
+    // Construir mensajes y llamar a OpenAI
     const messages = buildMessages({
         history,
         userText: rawBody,
@@ -312,18 +424,22 @@ async function processConversation(userId, rawBody, media = []) {
     });
     const finalReply = await callOpenAI(messages);
 
+    // Actualizar historial
     history.push({ role: 'user', content: rawBody });
     history.push({ role: 'assistant', content: finalReply });
     await saveSession(userId, { history });
 
+    // DEBUG: ver qué respondió
     console.log('[[AI_REPLY]]', finalReply.slice(0, 300));
 
+    // Enviar a Telegram si parece resumen de pedido
     if (finalReply.includes('Resumen de tu pedido')) {
         console.log('[TELEGRAM] disparando envío de pedido...');
         try {
+            const adminNote = buildAdminNote(userId, rawBody, finalReply);
             await sendOrderToTelegram({
                 wa: userId,
-                text: finalReply,
+                text: `${finalReply}\n\n${adminNote}`,
                 media,
             });
             console.log('[TELEGRAM] pedido enviado OK');
@@ -338,17 +454,22 @@ async function processConversation(userId, rawBody, media = []) {
 // ============== ENVIAR MENSAJE POR ULTRAMSG ==============
 async function sendUltraText(phoneNumber, text) {
     try {
-        if (!ULTRA_INSTANCE_ID || !ULTRA_TOKEN) {
+        if ((!ULTRA_INSTANCE_ID && !ULTRA_BASE_URL) || !ULTRA_TOKEN) {
             console.error(
-                '[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID o ULTRA_TOKEN en el .env'
+                '[ULTRA][SEND][ERROR] Faltan ULTRA_INSTANCE_ID/ULTRA_BASE_URL o ULTRA_TOKEN en el .env'
             );
             return;
         }
 
-        const url = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat?token=${ULTRA_TOKEN}`;
+        const baseUrl =
+            ULTRA_BASE_URL && ULTRA_BASE_URL.trim().length > 0 ?
+            ULTRA_BASE_URL.replace(/\/+$/, '') + '/' :
+            `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/`;
+
+        const url = `${baseUrl}messages/chat?token=${ULTRA_TOKEN}`;
 
         const payload = {
-            to: phoneNumber,
+            to: phoneNumber, // ej: 573108853158
             body: text,
             priority: 'high',
         };
@@ -360,13 +481,12 @@ async function sendUltraText(phoneNumber, text) {
             timeout: 15000,
         });
 
-        // Ultra responde { sent: 'true', ... } (string)
         if (process.env.DEBUG) {
             console.log('[ULTRA][SEND][RESP]', resp.data);
         }
 
-        const sentValue = resp.data && resp.data.sent;
-        if (sentValue !== true && sentValue !== 'true') {
+        // Ultra suele responder algo tipo { sent: 'true', ... }
+        if (!resp.data || String(resp.data.sent) !== 'true') {
             console.error('[ULTRA][SEND] respuesta inesperada:', resp.data);
         }
     } catch (e) {
@@ -391,9 +511,12 @@ async function handleUltraWebhook(req, res) {
         console.log('BODY RAW:', JSON.stringify(req.body, null, 2));
         console.log('========================================');
 
+        // Normalizamos payload (sirve para Ultra y otros)
         const { userWa, rawBody, src } = extractWhatsappPayload(req.body);
+
         console.log('>>> ULTRA PAYLOAD NORMALIZADO:', { userWa, rawBody });
 
+        // Si no hay remitente, no podemos responder
         if (!userWa) {
             console.error('[ULTRA] payload sin from');
             return res.status(200).json({
@@ -404,6 +527,7 @@ async function handleUltraWebhook(req, res) {
 
         const hasMedia = !!(src && src.media);
 
+        // Si no hay texto ni media, no hacemos nada
         if (!rawBody && !hasMedia) {
             console.error('[ULTRA] payload sin body ni media');
             return res.status(200).json({
@@ -412,8 +536,10 @@ async function handleUltraWebhook(req, res) {
             });
         }
 
+        // Ultra envía "57310...@c.us" → quitamos el sufijo
         const waNumber = userWa.replace(/@c\.us$/i, '');
 
+        // Media (si viene una imagen o similar)
         const media = [];
         if (hasMedia) {
             media.push(src.media);
@@ -432,6 +558,7 @@ async function handleUltraWebhook(req, res) {
             );
         }
 
+        // Si NO hay texto pero sí hay imagen → respuesta básica
         if (!rawBody && hasMedia) {
             const msg =
                 '🐶🐱 He recibido la foto que enviaste.\n' +
@@ -440,17 +567,21 @@ async function handleUltraWebhook(req, res) {
             return res.status(200).json({ ok: true });
         }
 
+        // Llamamos al "cerebro" del bot cuando hay texto
         const result = await processConversation(userId, rawBody, media);
         const finalReply =
-            (result && result.finalReply) ||
+            result && result.finalReply ?
+            result.finalReply :
             '¡Gracias! Ya mismo te respondo por aquí.';
 
+        // Enviar la respuesta al usuario por UltraMsg
         await sendUltraText(waNumber, finalReply);
 
         if (process.env.DEBUG) {
             console.log('OUT ULTRA << len =', finalReply.length);
         }
 
+        // A UltraMsg solo le devolvemos OK
         return res.status(200).json({ ok: true });
     } catch (err) {
         console.error('[ULTRA][ERROR]', err);
@@ -461,6 +592,7 @@ async function handleUltraWebhook(req, res) {
     }
 }
 
+// Ruta que usa el handler de UltraMsg
 app.post('/ultra-webhook', handleUltraWebhook);
 
 // ============== ARRANCAR SERVER ==============
